@@ -994,17 +994,20 @@ HTML_PAGE = '''
         <button id="downloadAliases">Aliases</button>
       </div>
     </div>
-    <div style="margin-top:8px; text-align:center;">
+
+    <div id="nodeSection" style="margin-top:8px; text-align:center;">
       <label style="color:lime; font-family:monospace; margin-right:8px;">Node Mode</label>
       <label class="switch">
         <input type="checkbox" id="nodeModeMainSwitch">
         <span class="slider"></span>
       </label>
+      <div style="color:#FF00FF; font-family:monospace; font-size:0.75em; white-space:normal; line-height:1.2; margin-top:4px; text-align:center;">
+        Polls detections every second instead of every 200 ms to reduce CPU/battery use and optimizes API for Node Mode.
+      </div>
     </div>
-    <div style="color:#FF00FF; font-family:monospace; font-size:0.75em; white-space:normal; line-height:1.2; margin-top:4px; text-align:center;">
-      Polls detections every second instead of every 200 ms to reduce CPU/battery use and optimizes API for Node Mode.
-    </div>
-    <div style="margin-top:8px; text-align:center;">
+    
+    <div id="zmqSection" style="margin-top:8px; text-align:center;">
+      <h4 class="downloadHeader">ZMQ Decoder</h4>
       <div style="margin-top:8px; text-align:center;">
         <label style="color:lime; font-family:monospace; margin-right:8px;">ZMQ Mode</label>
         <label class="switch">
@@ -1014,15 +1017,15 @@ HTML_PAGE = '''
       </div>
       <div style="margin-top:5px;">
         <div style="margin-top:5px; display:flex; justify-content:center; align-items:center;">
-            <input type="text" id="zmqIP" placeholder="127.0.0.1" 
-                    style="background-color: #222; color: #FF00FF; border: 1px solid #FF00FF; width:55%; padding:4px; margin-right:5px;">
-            <span style="color:lime;">:</span>
-            <input type="text" id="zmqPort" placeholder="4224" 
-                    style="background-color: #222; color: #FF00FF; border: 1px solid #FF00FF; width:25%; padding:4px; margin-left:5px;">
-          </div>
+          <input type="text" id="zmqIP" placeholder="127.0.0.1" 
+                  style="background-color: #222; color: #FF00FF; border: 1px solid #FF00FF; width:55%; padding:4px; margin-right:5px;">
+          <span style="color:lime;">:</span>
+          <input type="text" id="zmqPort" placeholder="4224" 
+                  style="background-color: #222; color: #FF00FF; border: 1px solid #FF00FF; width:25%; padding:4px; margin-left:5px;">
+        </div>
         <button id="applyZmqSettings" style="margin-top:5px; width:40%; padding: 5px; 
-            border: 1px solid lime; background: #333; color: lime; font-family: monospace; 
-            cursor: pointer; border-radius: 5px;">Update ZMQ</button>
+                border: 1px solid lime; background: #333; color: lime; font-family: monospace; 
+                cursor: pointer; border-radius: 5px;">Update ZMQ</button>
       </div>
       <div style="color:#FF00FF; font-family:monospace; font-size:0.75em; white-space:normal; line-height:1.2; margin-top:4px; text-align:center;">
         Connect to ZMQ decoder via direct IP connection
@@ -2012,11 +2015,21 @@ document.getElementById("filterToggle").addEventListener("click", function() {
   const box = document.getElementById("filterBox");
   const isCollapsed = box.classList.toggle("collapsed");
   this.textContent = isCollapsed ? "[+]" : "[-]";
+  
   // Sync Node Mode toggle with stored setting when filter opens
-  const mainSwitch = document.getElementById('nodeModeMainSwitch');
-  mainSwitch.checked = (localStorage.getItem('nodeMode') === 'true');
+  if (!isCollapsed) {
+    const mainSwitch = document.getElementById('nodeModeMainSwitch');
+    const zmqSwitch = document.getElementById('zmqModeSwitch');
+    // Update Node Mode toggle
+    if (mainSwitch) {
+      mainSwitch.checked = (localStorage.getItem('nodeMode') === 'true');
+    }
+    // Update ZMQ Mode toggle
+    if (zmqSwitch) {
+      zmqSwitch.checked = (localStorage.getItem('zmqEnabled') === 'true');
+    }
+  }
 });
-
 async function restorePaths() {
   try {
     const response = await fetch('/api/paths');
