@@ -739,9 +739,8 @@ HTML_PAGE = '''
       border-radius: 10px;
       color: lime;
       font-family: monospace;
-      max-height: 80vh;
-      overflow: hidden;
-      transition: max-height 0.3s ease;
+      overflow: visible;
+      transition: width 0.3s ease;
       z-index: 1000;
       transform: scale(0.85);
       transform-origin: top right;
@@ -1007,7 +1006,6 @@ HTML_PAGE = '''
     </div>
     
     <div id="zmqSection" style="margin-top:8px; text-align:center;">
-      <h4 class="downloadHeader">ZMQ Decoder</h4>
       <div style="margin-top:8px; text-align:center;">
         <label style="color:lime; font-family:monospace; margin-right:8px;">ZMQ Mode</label>
         <label class="switch">
