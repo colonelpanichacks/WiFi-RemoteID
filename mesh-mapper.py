@@ -335,6 +335,16 @@ PORT_SELECTION_PAGE = '''
   <meta charset="UTF-8">
   <title>Select USB Serial Ports</title>
   <style>
+    /* Hide tile seams */
+    .leaflet-tile {
+      border: none !important;
+      box-shadow: none !important;
+      background-color: transparent !important;
+      image-rendering: crisp-edges !important;
+    }
+    .leaflet-container {
+      background-color: black !important;
+    }
     body { background-color: black; color: lime; font-family: monospace; text-align: center;
       zoom: 1.15;
     }
@@ -458,6 +468,17 @@ HTML_PAGE = '''
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
   <style>
+    /* Hide tile seams on all map layers */
+    .leaflet-tile {
+      border: none !important;
+      box-shadow: none !important;
+      background-color: transparent !important;
+      image-rendering: crisp-edges !important;
+      transition: none !important;
+    }
+    .leaflet-container {
+      background-color: black !important;
+    }
     /* Toggle switch styling */
     .switch { position: relative; display: inline-block; width: 40px; height: 20px; }
     .switch input { opacity: 0; width: 0; height: 0; }
@@ -465,9 +486,7 @@ HTML_PAGE = '''
     .slider:before { position: absolute; content: ""; height: 16px; width: 16px; left: 2px; bottom: 2px; background-color: lime; transition: .4s; border-radius: 50%; }
     .switch input:checked + .slider { background-color: lime; }
     .switch input:checked + .slider:before { transform: translateX(20px); }
-    body, html { margin: 0; padding: 0; background-color: black;
-      zoom: 1.15;
-    }
+    body, html { margin: 0; padding: 0; background-color: black; }
     #map { height: 100vh; }
     /* Layer control styling (bottom left) reduced by 30% */
     #layerControl {
@@ -642,6 +661,9 @@ HTML_PAGE = '''
     }
     /* Disable tile transitions to prevent blur and hide tile seams */
     .leaflet-tile {
+      display: block;
+      margin: 0;
+      padding: 0;
       transition: none !important;
       image-rendering: crisp-edges;
       background-color: black;
@@ -827,7 +849,7 @@ window.onload = function() {
         // Restore drone marker if valid coordinates exist.
         if (det.drone_lat && det.drone_long && det.drone_lat != 0 && det.drone_long != 0) {
           if (!droneMarkers[mac]) {
-            droneMarkers[mac] = L.marker([det.drone_lat, det.drone_long], {icon: createIcon('🛸', color)})
+            droneMarkers[mac] = L.marker([det.drone_lat, det.drone_long], {icon: createIcon('🛸', color), pane: 'droneIconPane'})
                                   .bindPopup(generatePopupContent(det, 'drone'))
                                   .addTo(map);
           }
@@ -835,7 +857,7 @@ window.onload = function() {
         // Restore pilot marker if valid coordinates exist.
         if (det.pilot_lat && det.pilot_long && det.pilot_lat != 0 && det.pilot_long != 0) {
           if (!pilotMarkers[mac]) {
-            pilotMarkers[mac] = L.marker([det.pilot_lat, det.pilot_long], {icon: createIcon('👨‍✈️', color)})
+            pilotMarkers[mac] = L.marker([det.pilot_lat, det.pilot_long], {icon: createIcon('👤', color), pane: 'pilotIconPane'})
                                   .bindPopup(generatePopupContent(det, 'pilot'))
                                   .addTo(map);
           }
@@ -1166,35 +1188,43 @@ async function clearAlias(mac) {
 
 const osmStandard = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
   attribution: '© OpenStreetMap contributors',
-  maxZoom: 19
+  maxNativeZoom: 19,
+  maxZoom: 22,
 });
 const osmHumanitarian = L.tileLayer('https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png', {
   attribution: '© Humanitarian OpenStreetMap Team',
-  maxZoom: 19
+  maxNativeZoom: 19,
+  maxZoom: 22,
 });
 const cartoPositron = L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
   attribution: '© OpenStreetMap contributors, © CARTO',
-  maxZoom: 19
+  maxNativeZoom: 19,
+  maxZoom: 22,
 });
 const cartoDarkMatter = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
   attribution: '© OpenStreetMap contributors, © CARTO',
-  maxZoom: 19
+  maxNativeZoom: 19,
+  maxZoom: 22,
 });
 const esriWorldImagery = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
   attribution: 'Tiles © Esri',
-  maxZoom: 19
+  maxNativeZoom: 19,
+  maxZoom: 22,
 });
 const esriWorldTopo = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}', {
   attribution: 'Tiles © Esri',
-  maxZoom: 19
+  maxNativeZoom: 19,
+  maxZoom: 22,
 });
 const esriDarkGray = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}', {
   attribution: 'Tiles © Esri',
-  maxZoom: 16
+  maxNativeZoom: 16,
+  maxZoom: 16,
 });
 const openTopoMap = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', {
   attribution: '© OpenTopoMap contributors',
-  maxZoom: 17
+  maxNativeZoom: 17,
+  maxZoom: 17,
 });
 
   // Load persisted basemap selection or default to satellite imagery
@@ -1217,8 +1247,18 @@ const map = L.map('map', {
   center: persistedCenter || [0, 0],
   zoom: persistedZoom || 2,
   layers: [initialLayer],
-  attributionControl: false
+  attributionControl: false,
+  maxZoom: initialLayer.options.maxZoom
 });
+// create custom Leaflet panes for z-ordering
+map.createPane('pilotCirclePane');
+map.getPane('pilotCirclePane').style.zIndex = 600;
+map.createPane('pilotIconPane');
+map.getPane('pilotIconPane').style.zIndex = 601;
+map.createPane('droneCirclePane');
+map.getPane('droneCirclePane').style.zIndex = 650;
+map.createPane('droneIconPane');
+map.getPane('droneIconPane').style.zIndex = 651;
 
 map.on('moveend', function() {
   let center = map.getCenter();
@@ -1239,13 +1279,13 @@ map.on('zoomend', function() {
   });
   Object.keys(pilotMarkers).forEach(mac => {
     const color = get_color_for_mac(mac);
-    pilotMarkers[mac].setIcon(createIcon('👨‍✈️', color));
+    pilotMarkers[mac].setIcon(createIcon('👤', color));
   });
   // Update circle marker sizes
   Object.values(droneCircles).forEach(circle => circle.setRadius(circleRadius));
-  Object.values(pilotCircles).forEach(circle => circle.setRadius(circleRadius * 1.15));
+  Object.values(pilotCircles).forEach(circle => circle.setRadius(circleRadius));
   // Update broadcast ring sizes
-  Object.values(droneBroadcastRings).forEach(ring => ring.setRadius(size * 0.51));
+  Object.values(droneBroadcastRings).forEach(ring => ring.setRadius(size * 0.34));
   // Update observer icon size based on zoom level
   if (observerMarker) {
     const storedObserverEmoji = localStorage.getItem('observerEmoji') || "😎";
@@ -1269,6 +1309,13 @@ document.getElementById("layerSelect").addEventListener("change", function() {
   });
   newLayer.addTo(map);
   newLayer.redraw();
+  // Clamp zoom to the layer's allowed maxZoom to avoid missing tiles
+  const maxAllowed = newLayer.options.maxZoom;
+  if (map.getZoom() > maxAllowed) {
+    map.setZoom(maxAllowed);
+  }
+  // update map's allowed max zoom for this layer
+  map.options.maxZoom = maxAllowed;
   localStorage.setItem('basemap', value);
   this.style.backgroundColor = "rgba(0,0,0,0.8)";
   this.style.color = "#FF00FF";
@@ -1318,7 +1365,10 @@ function zoomToDrone(mac, detection) {
 function showHistoricalDrone(mac, detection) {
   const color = get_color_for_mac(mac);
   if (!droneMarkers[mac]) {
-    droneMarkers[mac] = L.marker([detection.drone_lat, detection.drone_long], {icon: createIcon('🛸', color)})
+    droneMarkers[mac] = L.marker([detection.drone_lat, detection.drone_long], {
+      icon: createIcon('🛸', color),
+      pane: 'droneIconPane'
+    })
                            .bindPopup(generatePopupContent(detection, 'drone'))
                            .addTo(map)
                            .on('click', function(){ map.setView(this.getLatLng(), map.getZoom()); });
@@ -1330,7 +1380,13 @@ function showHistoricalDrone(mac, detection) {
     const zoomLevel = map.getZoom();
     const size = Math.max(12, Math.min(zoomLevel * 1.5, 24));
     droneCircles[mac] = L.circleMarker([detection.drone_lat, detection.drone_long],
-                                       {radius: size * 0.34, color: color, fillColor: color, fillOpacity: 0.7})
+                                       {
+                                         pane: 'droneCirclePane',
+                                         radius: size * 0.34,
+                                         color: color,
+                                         fillColor: color,
+                                         fillOpacity: 0.7
+                                       })
                            .addTo(map);
   } else { droneCircles[mac].setLatLng([detection.drone_lat, detection.drone_long]); }
   if (!dronePathCoords[mac]) { dronePathCoords[mac] = []; }
@@ -1340,7 +1396,10 @@ function showHistoricalDrone(mac, detection) {
   dronePolylines[mac] = L.polyline(dronePathCoords[mac], {color: color}).addTo(map);
   if (detection.pilot_lat && detection.pilot_long && detection.pilot_lat != 0 && detection.pilot_long != 0) {
     if (!pilotMarkers[mac]) {
-      pilotMarkers[mac] = L.marker([detection.pilot_lat, detection.pilot_long], {icon: createIcon('👨‍✈️', color)})
+      pilotMarkers[mac] = L.marker([detection.pilot_lat, detection.pilot_long], {
+        icon: createIcon('👤', color),
+        pane: 'pilotIconPane'
+      })
                              .bindPopup(generatePopupContent(detection, 'pilot'))
                              .addTo(map)
                              .on('click', function(){ map.setView(this.getLatLng(), map.getZoom()); });
@@ -1352,9 +1411,23 @@ function showHistoricalDrone(mac, detection) {
       const zoomLevel = map.getZoom();
       const size = Math.max(12, Math.min(zoomLevel * 1.5, 24));
       pilotCircles[mac] = L.circleMarker([detection.pilot_lat, detection.pilot_long],
-                                          {radius: size * 0.34 * 1.15, color: color, fillColor: color, fillOpacity: 0.7})
+                                          {
+                                            pane: 'pilotCirclePane',
+                                            radius: size * 0.34,
+                                            color: color,
+                                            fillColor: color,
+                                            fillOpacity: 0.7
+                                          })
                             .addTo(map);
     } else { pilotCircles[mac].setLatLng([detection.pilot_lat, detection.pilot_long]); }
+    // Historical pilot path (dotted)
+    if (!pilotPathCoords[mac]) { pilotPathCoords[mac] = []; }
+    const lastPilotHis = pilotPathCoords[mac][pilotPathCoords[mac].length - 1];
+    if (!lastPilotHis || lastPilotHis[0] !== detection.pilot_lat || lastPilotHis[1] !== detection.pilot_long) {
+      pilotPathCoords[mac].push([detection.pilot_lat, detection.pilot_long]);
+    }
+    if (pilotPolylines[mac]) { map.removeLayer(pilotPolylines[mac]); }
+    pilotPolylines[mac] = L.polyline(pilotPathCoords[mac], { color: color, dashArray: '5,5' }).addTo(map);
   }
 }
 
@@ -1461,7 +1534,10 @@ async function updateData() {
           droneMarkers[mac].setLatLng([droneLat, droneLng]);
           if (!droneMarkers[mac].isPopupOpen()) { droneMarkers[mac].setPopupContent(generatePopupContent(det, 'drone')); }
         } else {
-          droneMarkers[mac] = L.marker([droneLat, droneLng], {icon: createIcon('🛸', color)})
+          droneMarkers[mac] = L.marker([droneLat, droneLng], {
+            icon: createIcon('🛸', color),
+            pane: 'droneIconPane'
+          })
                                 .bindPopup(generatePopupContent(det, 'drone'))
                                 .addTo(map)
                                 .on('click', function(){ map.setView(this.getLatLng(), map.getZoom()); });
@@ -1470,7 +1546,13 @@ async function updateData() {
         else {
           const zoomLevel = map.getZoom();
           const size = Math.max(12, Math.min(zoomLevel * 1.5, 24));
-          droneCircles[mac] = L.circleMarker([droneLat, droneLng], {radius: size * 0.34, color: color, fillColor: color, fillOpacity: 0.7}).addTo(map);
+          droneCircles[mac] = L.circleMarker([droneLat, droneLng], {
+            pane: 'droneCirclePane',
+            radius: size * 0.34,
+            color: color,
+            fillColor: color,
+            fillOpacity: 0.7
+          }).addTo(map);
         }
         if (!dronePathCoords[mac]) { dronePathCoords[mac] = []; }
         const lastDrone = dronePathCoords[mac][dronePathCoords[mac].length - 1];
@@ -1478,10 +1560,27 @@ async function updateData() {
         if (dronePolylines[mac]) { map.removeLayer(dronePolylines[mac]); }
         dronePolylines[mac] = L.polyline(dronePathCoords[mac], {color: color}).addTo(map);
         if (currentTime - det.last_update <= 15) {
-          if (droneBroadcastRings[mac]) { droneBroadcastRings[mac].setLatLng([droneLat, droneLng]); }
-          else { droneBroadcastRings[mac] = L.circleMarker([droneLat, droneLng], {radius: 16, color: "lime", fill: false, weight: 3}).addTo(map); }
+          const dynamicRadius = getDynamicSize() * 0.34;
+          const ringWeight = 3 * 0.8;  // 20% thinner
+          const ringRadius = dynamicRadius + ringWeight / 2;  // sit just outside the main circle
+          if (droneBroadcastRings[mac]) {
+            droneBroadcastRings[mac].setLatLng([droneLat, droneLng]);
+            droneBroadcastRings[mac].setRadius(ringRadius);
+            droneBroadcastRings[mac].setStyle({ weight: ringWeight });
+          } else {
+            droneBroadcastRings[mac] = L.circleMarker([droneLat, droneLng], {
+              pane: 'droneCirclePane',
+              radius: ringRadius,
+              color: "lime",
+              fill: false,
+              weight: ringWeight
+            }).addTo(map);
+          }
         } else {
-          if (droneBroadcastRings[mac]) { map.removeLayer(droneBroadcastRings[mac]); delete droneBroadcastRings[mac]; }
+          if (droneBroadcastRings[mac]) {
+            map.removeLayer(droneBroadcastRings[mac]);
+            delete droneBroadcastRings[mac];
+          }
         }
         if (followLock.enabled && followLock.type === 'drone' && followLock.id === mac) { map.setView([droneLat, droneLng], map.getZoom()); }
       }
@@ -1490,7 +1589,10 @@ async function updateData() {
           pilotMarkers[mac].setLatLng([pilotLat, pilotLng]);
           if (!pilotMarkers[mac].isPopupOpen()) { pilotMarkers[mac].setPopupContent(generatePopupContent(det, 'pilot')); }
         } else {
-          pilotMarkers[mac] = L.marker([pilotLat, pilotLng], {icon: createIcon('👨‍✈️', color)})
+          pilotMarkers[mac] = L.marker([pilotLat, pilotLng], {
+            icon: createIcon('👤', color),
+            pane: 'pilotIconPane'
+          })
                                 .bindPopup(generatePopupContent(det, 'pilot'))
                                 .addTo(map)
                                 .on('click', function(){ map.setView(this.getLatLng(), map.getZoom()); });
@@ -1499,7 +1601,13 @@ async function updateData() {
         else {
           const zoomLevel = map.getZoom();
           const size = Math.max(12, Math.min(zoomLevel * 1.5, 24));
-          pilotCircles[mac] = L.circleMarker([pilotLat, pilotLng], {radius: size * 0.34 * 1.15, color: color, fillColor: color, fillOpacity: 0.7}).addTo(map);
+          pilotCircles[mac] = L.circleMarker([pilotLat, pilotLng], {
+            pane: 'pilotCirclePane',
+            radius: size * 0.34,
+            color: color,
+            fillColor: color,
+            fillOpacity: 0.7
+          }).addTo(map);
         }
         if (!pilotPathCoords[mac]) { pilotPathCoords[mac] = []; }
         const lastPilot = pilotPathCoords[mac][pilotPathCoords[mac].length - 1];
@@ -1517,8 +1625,9 @@ async function updateData() {
 function createIcon(emoji, color) {
   // Compute a dynamic size based on zoom
   const size = getDynamicSize();
-  const isize = Math.round(size);
-  const half = Math.round(size / 2);
+  const actualSize = emoji === '👤' ? Math.round(size * 0.7) : Math.round(size);
+  const isize = actualSize;
+  const half = Math.round(actualSize / 2);
   return L.divIcon({
     html: `<div style="width:${isize}px; height:${isize}px; font-size:${isize}px; color:${color}; text-align:center; line-height:${isize}px;">${emoji}</div>`,
     className: '',
@@ -1529,8 +1638,9 @@ function createIcon(emoji, color) {
 
 function getDynamicSize() {
   const zoomLevel = map.getZoom();
-  // Clamp between 12px and 24px
-  return Math.max(12, Math.min(zoomLevel * 1.5, 24));
+  // Clamp between 12px and 24px, then boost by 15%
+  const base = Math.max(12, Math.min(zoomLevel * 1.5, 24));
+  return base * 1.15;
 }
 
 // Updated function: now updates all selected USB port statuses.
@@ -1608,7 +1718,7 @@ function updateColor(mac, hue) {
   localStorage.setItem('colorOverrides', JSON.stringify(colorOverrides));
   var newColor = "hsl(" + hue + ", 70%, 50%)";
   if (droneMarkers[mac]) { droneMarkers[mac].setIcon(createIcon('🛸', newColor)); droneMarkers[mac].setPopupContent(generatePopupContent(tracked_pairs[mac], 'drone')); }
-  if (pilotMarkers[mac]) { pilotMarkers[mac].setIcon(createIcon('👨‍✈️', newColor)); pilotMarkers[mac].setPopupContent(generatePopupContent(tracked_pairs[mac], 'pilot')); }
+  if (pilotMarkers[mac]) { pilotMarkers[mac].setIcon(createIcon('👤', newColor)); pilotMarkers[mac].setPopupContent(generatePopupContent(tracked_pairs[mac], 'pilot')); }
   if (droneCircles[mac]) { droneCircles[mac].setStyle({ color: newColor, fillColor: newColor }); }
   if (pilotCircles[mac]) { pilotCircles[mac].setStyle({ color: newColor, fillColor: newColor }); }
   if (dronePolylines[mac]) { dronePolylines[mac].setStyle({ color: newColor }); }
