@@ -8,6 +8,8 @@ import serial.tools.list_ports
 import time
 import csv
 import os
+import zmq
+from zmq.error import ZMQError
 from datetime import datetime
 from flask import Flask, request, jsonify, redirect, url_for, render_template_string, send_file
 from requests.adapters import HTTPAdapter
@@ -23,8 +25,16 @@ app = Flask(__name__)
 # ----------------------
 # Global Variables & Files
 # ----------------------
+
+# ZMQ Configuration
+ZMQ_ENABLED = False
+ZMQ_ENDPOINT = "tcp://127.0.0.1:4224"
+zmq_context = None
+zmq_socket = None
+
+# Logging, CSV/KML export
 tracked_pairs = {}
-detection_history = []  # For CSV logging and KML generation
+detection_history = []
 
 # Changed: Instead of one selected port, we allow up to three.
 SELECTED_PORTS = {}  # key will be 'port1', 'port2', 'port3'
@@ -151,6 +161,213 @@ def generate_kml():
 
 # Generate initial KML so the file exists from startup
 generate_kml()
+
+# ----------------------
+# ZMQ Client Handing & Decoding
+# ----------------------
+def zmq_client_thread():
+  """Thread to receive drone detection data from ZMQ publisher"""
+  global zmq_context, zmq_socket, ZMQ_ENABLED, ZMQ_ENDPOINT
+  
+  while True:
+    try:
+      if not ZMQ_ENABLED:
+        time.sleep(1)
+        continue
+      
+      if zmq_socket is None:
+        # Initialize ZMQ SUB socket
+        print(f"Connecting to ZMQ endpoint: {ZMQ_ENDPOINT}")
+        zmq_context = zmq.Context()
+        zmq_socket = zmq_context.socket(zmq.SUB)
+        zmq_socket.setsockopt(zmq.SUBSCRIBE, b"")  # Subscribe to all topics
+        zmq_socket.setsockopt(zmq.LINGER, 0)
+        zmq_socket.setsockopt(zmq.RECONNECT_IVL, 1000)  # 1 second reconnect interval
+        zmq_socket.connect(ZMQ_ENDPOINT)
+        print(f"Connected to ZMQ endpoint: {ZMQ_ENDPOINT}")
+        
+      # Use polling to prevent blocking indefinitely
+      poller = zmq.Poller()
+      poller.register(zmq_socket, zmq.POLLIN)
+      
+      print("Starting ZMQ message poll loop")
+      while ZMQ_ENABLED:
+        socks = dict(poller.poll(1000))  # 1 second timeout
+        if zmq_socket in socks and socks[zmq_socket] == zmq.POLLIN:
+          try:
+            print("ZMQ message available - receiving...")
+            message = zmq_socket.recv_string()
+            print(f"ZMQ message received, length: {len(message)}")
+            process_zmq_message(message)
+          except zmq.ZMQError as e:
+            print(f"ZMQ receive error: {e}")
+            break
+          except Exception as e:
+            print(f"Error processing ZMQ message: {e}")
+            import traceback
+            traceback.print_exc()
+            
+        # Small delay to prevent CPU spinning
+        time.sleep(0.1)
+        
+      print("ZMQ_ENABLED is now False, exiting poll loop")
+      
+    except Exception as e:
+      print(f"ZMQ client thread error: {e}")
+      import traceback
+      traceback.print_exc()
+      
+      # Clean up socket on error
+      if zmq_socket:
+        zmq_socket.close()
+        zmq_socket = None
+      if zmq_context:
+        zmq_context.term()
+        zmq_context = None
+      time.sleep(5)  # Wait before reconnecting
+
+def process_zmq_message(message):
+  """Process ZMQ messages from zmq_decoder.py"""
+  try:
+    print(f"Raw ZMQ message received: {message[:200]}...")  # Debug logging
+    data = json.loads(message)
+    
+    # For debugging, log the entire message structure
+    if isinstance(data, dict):
+      print(f"ZMQ message keys: {list(data.keys())}")
+    elif isinstance(data, list):
+      print(f"ZMQ message is a list with {len(data)} items")
+      if len(data) > 0 and isinstance(data[0], dict):
+        print(f"First item keys: {list(data[0].keys())}")
+        
+    # BT message with parsed data - Format from your example
+    if isinstance(data, list) and len(data) > 0:
+      processed = False
+      mac = None
+      basic_id = None
+      location_data = {}
+      system_data = {}
+      
+      # First pass - collect basic ID and MAC
+      for item in data:
+        if isinstance(item, dict) and "Basic ID" in item:
+          basic_id_info = item["Basic ID"]
+          basic_id = basic_id_info.get("id", "")
+          # Try to get MAC from various places
+          if "MAC" in basic_id_info:
+            mac = basic_id_info["MAC"]
+            break
+          
+      # If no MAC found in Basic ID, look in the AUX_ADV_IND/aext block
+      if not mac and "AUX_ADV_IND" in data:
+        if "aext" in data and "AdvA" in data["aext"]:
+          mac = data["aext"]["AdvA"].split()[0]  # Get just the MAC part
+          
+      # Second pass - collect location and system data
+      for item in data:
+        if isinstance(item, dict):
+          # Location data
+          if "Location" in item:
+            loc = item["Location"]
+            location_data = {
+              "drone_lat": loc.get("Latitude", 0),
+              "drone_long": loc.get("Longitude", 0),
+              "drone_altitude": loc.get("AltitudeGeo", 0),
+              "height_agl": loc.get("Height", 0),
+              "speed": loc.get("SpeedHorizontal", 0),
+              "direction": loc.get("Direction", 0)
+            }
+            
+          # System data (for pilot location)
+          if "System" in item:
+            sys = item["System"]
+            system_data = {
+              "pilot_lat": sys.get("OperatorLatitude", 0),
+              "pilot_long": sys.get("OperatorLongitude", 0)
+            }
+            
+      # If we have a MAC, create and update detection
+      if mac:
+        detection = {
+          "mac": mac,
+          "basic_id": basic_id,
+          "source": "BT/ZMQ"
+        }
+        
+        # Add RSSI if available
+        if "AUX_ADV_IND" in data and isinstance(data["AUX_ADV_IND"], dict):
+          detection["rssi"] = data["AUX_ADV_IND"].get("rssi", 0)
+          
+        # Add location data
+        detection.update(location_data)
+        
+        # Add system data
+        detection.update(system_data)
+        
+        # Update the detection
+        update_detection(detection)
+        processed = True
+        
+      return processed
+    
+    # WiFi message with nested message structure - example from your message
+    elif isinstance(data, dict) and "Basic ID" in data:
+      mac = data["Basic ID"].get("MAC", "")
+      if not mac:
+        print("No MAC address in WiFi Basic ID message, skipping")
+        return False
+      
+      # Create a base detection with the MAC
+      detection = {
+        "mac": mac,
+        "rssi": data["Basic ID"].get("RSSI", 0) if "RSSI" in data["Basic ID"] else 0,
+        "basic_id": data["Basic ID"].get("id", ""),
+        "source": "WiFi/ZMQ",
+        "index": data.get("index", 0),
+        "runtime": data.get("runtime", 0)
+      }
+      
+      # Add location data if available
+      if "Location/Vector Message" in data:
+        loc = data["Location/Vector Message"]
+        detection["drone_lat"] = loc.get("latitude", 0)
+        detection["drone_long"] = loc.get("longitude", 0)
+        detection["drone_altitude"] = loc.get("geodetic_altitude", 0)
+        detection["height_agl"] = loc.get("height_agl", 0)
+        detection["speed"] = loc.get("speed", 0)
+        detection["direction"] = loc.get("direction", 0)
+        
+      # Add operator/system location if available
+      if "System Message" in data:
+        sys = data["System Message"]
+        detection["pilot_lat"] = sys.get("operator_lat", 0)
+        detection["pilot_long"] = sys.get("operator_lon", 0)
+        
+      # Add self-ID info if available
+      if "Self-ID Message" in data:
+        self_id = data["Self-ID Message"]
+        if "description" in self_id and self_id["description"]:
+          detection["description"] = self_id["description"]
+        elif "text" in self_id and self_id["text"]:
+          detection["description"] = self_id["text"]
+          
+      # Update the detection
+      update_detection(detection)
+      return True
+    
+    else:
+      print(f"Unrecognized ZMQ message format")
+      return False
+    
+  except json.JSONDecodeError as e:
+    print(f"Invalid JSON from ZMQ: {e}")
+    print(f"Raw message: {message[:100]}")
+    return False
+  except Exception as e:
+    print(f"Error processing ZMQ message: {e}")
+    import traceback
+    traceback.print_exc()
+    return False
 
 # ----------------------
 # Detection Update & CSV Logging
@@ -787,10 +1004,37 @@ HTML_PAGE = '''
     <div style="color:#FF00FF; font-family:monospace; font-size:0.75em; white-space:normal; line-height:1.2; margin-top:4px; text-align:center;">
       Polls detections every second instead of every 200 ms to reduce CPU/battery use and optimizes API for Node Mode.
     </div>
+    <div style="margin-top:8px; text-align:center;">
+      <div style="margin-top:8px; text-align:center;">
+        <label style="color:lime; font-family:monospace; margin-right:8px;">ZMQ Mode</label>
+        <label class="switch">
+          <input type="checkbox" id="zmqModeSwitch">
+          <span class="slider"></span>
+        </label>
+      </div>
+      <div style="margin-top:5px;">
+        <div style="margin-top:5px; display:flex; justify-content:center; align-items:center;">
+            <input type="text" id="zmqIP" placeholder="127.0.0.1" 
+                    style="background-color: #222; color: #FF00FF; border: 1px solid #FF00FF; width:55%; padding:4px; margin-right:5px;">
+            <span style="color:lime;">:</span>
+            <input type="text" id="zmqPort" placeholder="4224" 
+                    style="background-color: #222; color: #FF00FF; border: 1px solid #FF00FF; width:25%; padding:4px; margin-left:5px;">
+          </div>
+        <button id="applyZmqSettings" style="margin-top:5px; width:40%; padding: 5px; 
+            border: 1px solid lime; background: #333; color: lime; font-family: monospace; 
+            cursor: pointer; border-radius: 5px;">Update ZMQ</button>
+      </div>
+      <div style="color:#FF00FF; font-family:monospace; font-size:0.75em; white-space:normal; line-height:1.2; margin-top:4px; text-align:center;">
+        Connect to ZMQ decoder via direct IP connection
+      </div>
+    </div>
   </div>
 </div>
 <div id="serialStatus">
-  <!-- USB port statuses will be injected here -->
+  <!-- USB port & ZMQ statuses will be injected here -->
+  <div id="zmqStatusDisplay" style="display: none;">
+      <span class="usb-name">ZMQ</span>: <span id="zmqConnectionStatus" style="color: red;">Disconnected</span>
+  </div>
 </div>
 <script>
   // Round tile positions to integer pixels to eliminate seams
@@ -801,15 +1045,15 @@ HTML_PAGE = '''
       original.call(this, el, rounded);
     };
   })();
-// --- Node Mode Main Switch & Polling Interval Sync ---
+// --- Node Mode & ZMQ Mode Settings ---
 document.addEventListener('DOMContentLoaded', () => {
-  // Ensure Node Mode default is off if unset
+  // Ensure Node Mode default is off if unset (existing code)
   if (localStorage.getItem('nodeMode') === null) {
     localStorage.setItem('nodeMode', 'false');
   }
   const mainSwitch = document.getElementById('nodeModeMainSwitch');
   if (mainSwitch) {
-    // Sync toggle with stored setting
+    // Sync toggle with stored setting (existing code)
     mainSwitch.checked = (localStorage.getItem('nodeMode') === 'true');
     mainSwitch.onchange = () => {
       const enabled = mainSwitch.checked;
@@ -821,7 +1065,84 @@ document.addEventListener('DOMContentLoaded', () => {
       if (popupSwitch) popupSwitch.checked = enabled;
     };
   }
-  // Start polling based on current setting
+  
+  // ZMQ Settings
+  if (localStorage.getItem('zmqEnabled') === null) {
+    localStorage.setItem('zmqEnabled', 'false');
+  }
+  const zmqSwitch = document.getElementById('zmqModeSwitch');
+  const zmqIP = document.getElementById('zmqIP');
+  const zmqPort = document.getElementById('zmqPort');
+  const applyButton = document.getElementById('applyZmqSettings');
+  
+  if (zmqSwitch && zmqIP && zmqPort && applyButton) {
+    // Sync toggle with stored setting
+    zmqSwitch.checked = (localStorage.getItem('zmqEnabled') === 'true');
+    
+    // Parse stored endpoint if exists
+    const storedEndpoint = localStorage.getItem('zmqEndpoint') || 'tcp://127.0.0.1:4224';
+    try {
+      const endpoint = new URL(storedEndpoint);
+      const hostParts = endpoint.host.split(':');
+      zmqIP.value = hostParts[0] || '127.0.0.1';
+      zmqPort.value = hostParts[1] || '4224';
+    } catch(e) {
+      // Default values if parsing fails
+      zmqIP.value = '127.0.0.1';
+      zmqPort.value = '4224';
+    }
+    
+    // Initialize from server
+    fetch('/api/zmq_settings')
+      .then(response => response.json())
+      .then(data => {
+        zmqSwitch.checked = data.enabled;
+        
+        try {
+          const endpoint = new URL(data.endpoint);
+          const hostParts = endpoint.host.split(':');
+          zmqIP.value = hostParts[0] || '127.0.0.1';
+          zmqPort.value = hostParts[1] || '4224';
+        } catch(e) {
+          // Keep existing values if parsing fails
+          console.error('Error parsing endpoint from server:', e);
+        }
+        
+        localStorage.setItem('zmqEnabled', data.enabled);
+        localStorage.setItem('zmqEndpoint', data.endpoint);
+      })
+      .catch(error => {
+        console.error('Error fetching ZMQ settings:', error);
+      });
+    
+    // Apply button handler
+    applyButton.addEventListener('click', function() {
+      this.style.backgroundColor = 'purple';
+      setTimeout(() => { this.style.backgroundColor = '#333'; }, 300);
+      
+      // Construct endpoint from IP and port
+      const ip = zmqIP.value.trim() || '127.0.0.1';
+      const port = zmqPort.value.trim() || '4224';
+      const endpoint = `tcp://${ip}:${port}`;
+      
+      localStorage.setItem('zmqEnabled', zmqSwitch.checked);
+      localStorage.setItem('zmqEndpoint', endpoint);
+      
+      fetch('/api/zmq_settings', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          enabled: zmqSwitch.checked,
+          endpoint: endpoint
+        })
+      })
+      .then(response => response.json())
+      .catch(error => {
+        console.error('Error applying ZMQ settings:', error);
+      });
+    });
+  }  
+  // Start polling based on current Node Mode setting
   updateData();
   updateDataInterval = setInterval(updateData, mainSwitch && mainSwitch.checked ? 1000 : 200);
 });
@@ -1650,16 +1971,27 @@ async function updateSerialStatus() {
     const data = await response.json();
     const statusDiv = document.getElementById('serialStatus');
     statusDiv.innerHTML = "";
+    
+    // Add USB statuses (existing code)
     if (data.statuses) {
       for (const port in data.statuses) {
         const div = document.createElement("div");
-        // Device name in neon pink and status color accordingly.
         div.innerHTML = '<span class="usb-name">' + port + '</span>: ' +
           (data.statuses[port] ? '<span style="color: lime;">Connected</span>' : '<span style="color: red;">Disconnected</span>');
         statusDiv.appendChild(div);
       }
     }
-  } catch (error) { console.error("Error fetching serial status:", error); }
+    
+    // Add ZMQ status if enabled
+    if (data.zmq && data.zmq.enabled) {
+      const div = document.createElement("div");
+      div.innerHTML = '<span class="usb-name">ZMQ</span>: ' +
+        (data.zmq.connected ? '<span style="color: lime;">Connected</span>' : '<span style="color: red;">Disconnected</span>');
+      statusDiv.appendChild(div);
+    }
+  } catch (error) { 
+    console.error("Error fetching serial status:", error); 
+  }
 }
 setInterval(updateSerialStatus, 1000);
 updateSerialStatus();
@@ -1796,6 +2128,74 @@ self.addEventListener('fetch', function(event) {
     response.headers['Content-Type'] = 'application/javascript'
     return response
 
+
+# ----------------------
+# New route: ZMQ Connection
+# ----------------------
+@app.route('/api/zmq_settings', methods=['GET', 'POST'])
+def api_zmq_settings():
+  global ZMQ_ENABLED, ZMQ_ENDPOINT, zmq_socket, zmq_context
+  
+  if request.method == 'POST':
+    data = request.get_json()
+    new_enabled = data.get('enabled', False)
+    new_endpoint = data.get('endpoint', ZMQ_ENDPOINT)
+    
+    # Ensure endpoint has tcp:// prefix
+    if new_endpoint and not new_endpoint.startswith('tcp://'):
+      new_endpoint = 'tcp://' + new_endpoint
+      
+    # If enabling ZMQ or changing endpoint while enabled
+    if (new_enabled and not ZMQ_ENABLED) or (new_enabled and ZMQ_ENDPOINT != new_endpoint):
+      # Close existing connection if active
+      if zmq_socket:
+        zmq_socket.close()
+        zmq_socket = None
+      if zmq_context:
+        zmq_context.term()
+        zmq_context = None
+        
+      # Update settings
+      ZMQ_ENABLED = new_enabled
+      ZMQ_ENDPOINT = new_endpoint
+      
+      # Start ZMQ thread if it's not already running
+      if not any(t.name == "zmq_client" for t in threading.enumerate()):
+        zmq_thread = threading.Thread(target=zmq_client_thread, daemon=True, name="zmq_client")
+        zmq_thread.start()
+        
+    # If disabling ZMQ
+    elif not new_enabled and ZMQ_ENABLED:
+      ZMQ_ENABLED = False
+      # Close connections
+      if zmq_socket:
+        zmq_socket.close()
+        zmq_socket = None
+      if zmq_context:
+        zmq_context.term()
+        zmq_context = None
+        
+    # Just update endpoint if disabled
+    else:
+      ZMQ_ENDPOINT = new_endpoint
+      
+    # Save settings to file
+    try:
+      with open(os.path.join(BASE_DIR, "zmq_config.json"), "w") as f:
+        json.dump({
+          "enabled": ZMQ_ENABLED,
+          "endpoint": ZMQ_ENDPOINT
+        }, f)
+    except Exception as e:
+      print("Error saving ZMQ config:", e)
+      
+    return jsonify({"status": "ok"})
+  
+  # GET method - return current settings
+  return jsonify({
+    "enabled": ZMQ_ENABLED,
+    "endpoint": ZMQ_ENDPOINT
+  })
 
 # ----------------------
 # New route: USB port selection for multiple ports.
@@ -1947,7 +2347,15 @@ def api_ports():
 # Updated status endpoint: returns a dict of statuses for each selected USB.
 @app.route('/api/serial_status', methods=['GET'])
 def api_serial_status():
-    return jsonify({"statuses": serial_connected_status})
+  global zmq_socket
+  return jsonify({
+    "statuses": serial_connected_status,
+    "zmq": {
+      "enabled": ZMQ_ENABLED,
+      "connected": zmq_socket is not None,
+      "endpoint": ZMQ_ENDPOINT
+    }
+  })
 
 @app.route('/api/paths', methods=['GET'])
 def api_paths():
@@ -2071,4 +2479,21 @@ def download_aliases():
     return send_file(ALIASES_FILE, as_attachment=True)
 
 if __name__ == '__main__':
+    zmq_config_file = os.path.join(BASE_DIR, "zmq_config.json")
+    if os.path.exists(zmq_config_file):
+      try:
+        with open(zmq_config_file, "r") as f:
+          zmq_config = json.load(f)
+          ZMQ_ENABLED = zmq_config.get("enabled", False)
+          ZMQ_ENDPOINT = zmq_config.get("endpoint", ZMQ_ENDPOINT)
+          if ZMQ_ENABLED:
+            # Start ZMQ client thread if enabled in config
+            zmq_thread = threading.Thread(target=zmq_client_thread, daemon=True, name="zmq_client")
+            zmq_thread.start()
+            print(f"Started ZMQ client from config file, connecting to {ZMQ_ENDPOINT}")
+      except Exception as e:
+        print(f"Error loading ZMQ config from {zmq_config_file}: {e}")
+        
+    # Start the Flask application
     app.run(host='0.0.0.0', port=5000)
+  
