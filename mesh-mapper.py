@@ -1032,18 +1032,26 @@ PORT_SELECTION_PAGE = '''
         <option value="{{ port.device }}">{{ port.device }} - {{ port.description }}</option>
       {% endfor %}
     </select><br>
-    <div style="margin-top:5px; text-align:center;">
-      <label for="webhookUrl" style="font-size:18px; font-family:'Orbitron', monospace; color:#87CEEB;">Webhook Destination URL</label><br>
-      <input type="text" id="webhookUrl" placeholder="https://example.com/webhook"
+    <div style="margin-bottom:24px;"></div>
+    <div style="margin-top:5px; margin-bottom:6px; text-align:center;">
+      <label for="webhookUrl" style="font-size:18px; font-family:'Orbitron', monospace; color:#87CEEB;">Webhook URL</label><br>
+      <input type="text" id="webhookUrl" placeholder="httpsdvvdvv://example.com/webhook"
              style="width:300px; background-color:#222; color:#87CEEB; border:1px solid #FF00FF; padding:4px; font-size:1em; outline:none;">
     </div>
-    <div id="portTakModeContainer" class="tooltip-container" style="text-align:center; margin:5px 0;">
+    <div style="margin-top:6px; margin-bottom:12px; text-align:center;">
+      <button id="updateWebhookButton" style="border:1px solid lime; background-color:#333; color:#FF00FF; font-family:'Orbitron',monospace; padding:4px 8px; cursor:pointer; border-radius:4px;">
+        Update Webhook
+      </button>
+    </div>
+    <div id="portTakModeContainer" style="text-align:center; margin-top:24px; margin-bottom:5px;">
         <label style="font-size:18px; font-family:'Orbitron', monospace; display:inline-block; margin-right:10px; vertical-align:middle;">Enable TAK Mode</label>
-        <label class="switch" style="vertical-align:middle;">
-          <input type="checkbox" id="portTakModeSwitch">
-          <span class="slider"></span>
-        </label>
-        <div class="tak-tooltip">Please note - if mesh-mapper is not able to connect to your TAK server, you will need to disable TAK Mode in order to access the mapping screen.</div>
+        <div class="tooltip-container" style="display:inline-block; vertical-align:middle;">
+          <label class="switch">
+            <input type="checkbox" id="portTakModeSwitch">
+            <span class="slider"></span>
+          </label>
+          <div class="tak-tooltip">Please note - if mesh-mapper is not able to connect to your TAK server, you will need to disable TAK Mode in order to access the mapping screen.</div>
+        </div>
     </div>
     <div id="portTakSettings" style="display:none; text-align:center;">
       <label style="display:inline-block; margin-right:10px; margin-bottom:5px;">TAK IP: <input type="text" id="portTakIP" value="127.0.0.1" style="width:100px;"></label>
@@ -1060,6 +1068,7 @@ PORT_SELECTION_PAGE = '''
     <button id="beginMapping" type="submit" style="display:block; margin:20px auto 0; padding:8px 12px; border:1px solid lime; background-color:#333; color:lime; font-family:monospace; cursor:pointer;">
       Begin Mapping
     </button>
+    <div style="margin-bottom:24px;"></div>
   </form>
   <pre class="ascii-art">{{ bottom_ascii }}</pre>
   <script>
@@ -1182,6 +1191,12 @@ PORT_SELECTION_PAGE = '''
     webhookInput.value = storedWebhookUrl;
     webhookInput.addEventListener('change', () => {
       localStorage.setItem('popupWebhookUrl', webhookInput.value.trim());
+    });
+    document.getElementById('updateWebhookButton').addEventListener('click', function(e) {
+      e.preventDefault();
+      const url = document.getElementById('webhookUrl').value.trim();
+      localStorage.setItem('popupWebhookUrl', url);
+      console.log('Webhook URL updated to', url);
     });
 
     // Load persisted TAK settings on page load
@@ -2324,6 +2339,22 @@ async function queryFaaAPI(mac, remote_id) {
                 } else {
                   faaDiv.innerHTML = '<div style="border:2px solid #FF69B4; padding:5px; margin:5px 0;">No FAA data available</div>';
                 }
+            }
+            // Immediately refresh popups with new FAA data
+            const key = result.mac || mac;
+            if (typeof tracked_pairs !== "undefined" && tracked_pairs[key]) {
+              if (droneMarkers[key]) {
+                droneMarkers[key].setPopupContent(generatePopupContent(tracked_pairs[key], 'drone'));
+                if (droneMarkers[key].isPopupOpen()) {
+                  droneMarkers[key].openPopup();
+                }
+              }
+              if (pilotMarkers[key]) {
+                pilotMarkers[key].setPopupContent(generatePopupContent(tracked_pairs[key], 'pilot'));
+                if (pilotMarkers[key].isPopupOpen()) {
+                  pilotMarkers[key].openPopup();
+                }
+              }
             }
         } else {
             alert("FAA API error: " + result.message);
