@@ -2062,20 +2062,22 @@ function showTerminalPopup(det, isNew) {
   const isMobile = window.innerWidth <= 600;
   Object.assign(popup.style, {
     position: 'fixed',
-    top: isMobile ? '60px' : '10px',
+    top: isMobile ? '50px' : '10px',
     left: '50%',
     transform: 'translateX(-50%)',
     background: 'rgba(0,0,0,0.8)',
     color: 'lime',
     fontFamily: 'monospace',
-    whiteSpace: 'nowrap',
+    whiteSpace: 'normal',
     padding: isMobile ? '2px 4px' : '4px 8px',
     border: '1px solid lime',
     borderRadius: '4px',
     zIndex: 2000,
     opacity: 0.9,
-    fontSize: isMobile ? '0.75em' : '',
+    fontSize: isMobile ? '0.6em' : '',
+    maxWidth: isMobile ? '80vw' : 'none',
     display: 'inline-block',
+    textAlign: 'center',
   });
 
   // Build concise popup text
