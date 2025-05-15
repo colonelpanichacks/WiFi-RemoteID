@@ -3,7 +3,7 @@ import time
 import json
 import csv
 import logging
-import colorsys 
+import colorsys
 import threading
 import subprocess
 import socket
@@ -18,6 +18,74 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from flask import Flask, request, jsonify, redirect, url_for, render_template, render_template_string, send_file
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+ # Helper: consistent color per MAC via hashing
+def get_color_for_mac(mac: str) -> str:
+    # Compute hue from MAC string hash
+    hue = sum(ord(c) for c in mac) % 360
+    r, g, b = colorsys.hsv_to_rgb(hue/360.0, 1.0, 1.0)
+    ri, gi, bi = int(r*255), int(g*255), int(b*255)
+    # Return ABGR format
+    return f"ff{bi:02x}{gi:02x}{ri:02x}"
+
+def append_to_cumulative_kml(prev: dict, curr: dict):
+    """
+    Append only new segment and icons for MAC curr['mac'] to cumulative.kml.
+    """
+    mac = curr['mac']
+    alias = ALIASES.get(mac, '')
+    aliasStr = f"{alias} " if alias else ""
+    color = get_color_for_mac(mac)
+    lines = []
+    # Drone segment
+    if prev and prev.get('drone_lat') and curr.get('drone_lat'):
+        coords = f"{prev['drone_long']},{prev['drone_lat']},0 " \
+                 f"{curr['drone_long']},{curr['drone_lat']},0"
+        lines += [
+            f'<Placemark><name>Drone Segment {aliasStr}{mac}</name>',
+            f'<Style><LineStyle><color>{color}</color><width>2</width></LineStyle></Style>',
+            '<LineString><tessellate>1</tessellate>',
+            f'<coordinates>{coords}</coordinates></LineString></Placemark>'
+        ]
+    # Drone icon
+    if curr.get('drone_lat') and curr.get('drone_long'):
+        lines += [
+            f'<Placemark><name>Drone {aliasStr}{mac}</name>',
+            f'<Style><IconStyle><color>{color}</color><scale>1.2</scale>'
+            '<Icon><href>http://maps.google.com/mapfiles/kml/shapes/heliport.png</href></Icon>'
+            '</IconStyle></Style>',
+            f'<Point><coordinates>{curr["drone_long"]},{curr["drone_lat"]},0</coordinates></Point>',
+            '</Placemark>'
+        ]
+    # Pilot segment
+    if prev and prev.get('pilot_lat') and curr.get('pilot_lat'):
+        coords = f"{prev['pilot_long']},{prev['pilot_lat']},0 " \
+                 f"{curr['pilot_long']},{curr['pilot_lat']},0"
+        lines += [
+            f'<Placemark><name>Pilot Segment {aliasStr}{mac}</name>',
+            f'<Style><LineStyle><color>{color}</color><width>2</width><gx:dash/></LineStyle></Style>',
+            '<LineString><tessellate>1</tessellate>',
+            f'<coordinates>{coords}</coordinates></LineString></Placemark>'
+        ]
+    # Pilot icon
+    if curr.get('pilot_lat') and curr.get('pilot_long'):
+        lines += [
+            f'<Placemark><name>Pilot {aliasStr}{mac}</name>',
+            f'<Style><IconStyle><color>{color}</color><scale>1.2</scale>'
+            '<Icon><href>http://maps.google.com/mapfiles/kml/shapes/man.png</href></Icon>'
+            '</IconStyle></Style>',
+            f'<Point><coordinates>{curr["pilot_long"]},{curr["pilot_lat"]},0</coordinates></Point>',
+            '</Placemark>'
+        ]
+    # Append to cumulative.kml before closing tags
+    with open(CUMULATIVE_KML_FILENAME, "r+") as f:
+        raw = f.read()
+        # Remove the last closing tags exactly once
+        parts = raw.rsplit("</Document>\n</kml>", 1)
+        content = parts[0]
+        f.seek(0)
+        f.write(content + "\n" + "\n".join(lines) + "\n</Document>\n</kml>")
+        f.truncate()
 
 # Server-side webhook URL (set via API)
 WEBHOOK_URL = None
@@ -62,7 +130,7 @@ CUMULATIVE_KML_FILENAME = os.path.join(BASE_DIR, "cumulative.kml")
 if not os.path.exists(CUMULATIVE_KML_FILENAME):
     with open(CUMULATIVE_KML_FILENAME, "w") as f:
         f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
-        f.write('<kml xmlns="http://www.opengis.net/kml/2.2">\n')
+        f.write('<kml xmlns="http://www.opengis.net/kml/2.2" xmlns:gx="http://www.google.com/kml/ext/2.2">\n')
         f.write('<Document>\n')
         f.write(f'<name>Cumulative Detections</name>\n')
         f.write('</Document>\n</kml>')
@@ -170,7 +238,7 @@ def generate_kml():
     # Start KML document template
     kml_lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
-        '<kml xmlns="http://www.opengis.net/kml/2.2">',
+        '<kml xmlns="http://www.opengis.net/kml/2.2" xmlns:gx="http://www.google.com/kml/ext/2.2">',
         '<Document>',
         f'<name>Detections {startup_timestamp}</name>'
     ]
@@ -197,22 +265,27 @@ def generate_kml():
                 '</LineString></Placemark>'
             )
 
-        # --- Pilot flight path ---
-        pilot_coords = [
-            f"{d['pilot_long']},{d['pilot_lat']},0"
-            for d in detection_history
-            if d.get('mac') == mac and d.get('pilot_lat') and d.get('pilot_long')
-        ]
-        if pilot_coords:
+        # --- Pilot flight path (dashed segments for valid runs) ---
+        runs = []
+        current_run = []
+        for d in detection_history:
+            if d.get('mac') == mac and d.get('pilot_lat') and d.get('pilot_long'):
+                # collect valid consecutive points
+                current_run.append(f"{d['pilot_long']},{d['pilot_lat']},0")
+            else:
+                if len(current_run) > 1:
+                    runs.append(current_run)
+                current_run = []
+        # finalize last run
+        if len(current_run) > 1:
+            runs.append(current_run)
+        # emit one Placemark per run with dashed style
+        for run in runs:
+            coords = " ".join(run)
             kml_lines.append(f'<Placemark><name>Pilot Path {aliasStr}{mac}</name>')
-            kml_lines.append(
-                f'<Style><LineStyle><color>{color}</color><width>2</width></LineStyle></Style>'
-            )
+            kml_lines.append(f'<Style><LineStyle><color>{color}</color><width>2</width><gx:dash/></LineStyle></Style>')
             kml_lines.append('<LineString><tessellate>1</tessellate>')
-            kml_lines.append(
-                f'<coordinates>{" ".join(pilot_coords)}</coordinates>'
-                '</LineString></Placemark>'
-            )
+            kml_lines.append(f'<coordinates>{coords}</coordinates></LineString></Placemark>')
 
         # --- Current position icons ---
         det = tracked_pairs.get(mac, {})
@@ -248,12 +321,10 @@ def generate_kml():
     # Close document
     kml_lines.append('</Document></kml>')
 
-    # Write *both* session and cumulative files with full colored paths+icons
-    for fname in (KML_FILENAME, CUMULATIVE_KML_FILENAME):
-        with open(fname, "w") as f:
-            f.write("\n".join(kml_lines))
-
-    print("Updated KML files:", KML_FILENAME, CUMULATIVE_KML_FILENAME)
+    # Write only session KML
+    with open(KML_FILENAME, "w") as f:
+        f.write("\n".join(kml_lines))
+    print("Updated session KML:", KML_FILENAME)
 
 # Generate initial KML so the file exists from startup
 generate_kml()
@@ -266,6 +337,7 @@ def update_detection(detection):
     mac = detection.get("mac")
     if not mac:
         return
+    prev = tracked_pairs.get(mac)
 
     # Retrieve new drone coordinates from the detection
     new_drone_lat = detection.get("drone_lat", 0)
@@ -326,10 +398,8 @@ def update_detection(detection):
         # Cache FAA data even for no-GPS
         if detection.get('basic_id'):
             write_to_faa_cache(mac, detection['basic_id'], detection.get('faa_data', {}))
-
         # Update KMLs
         generate_kml()
-
         return
 
     # Otherwise, use the provided non-zero coordinates.
@@ -409,6 +479,8 @@ def update_detection(detection):
             'basic_id': detection.get('basic_id', ''),
             'faa_data': json.dumps(detection.get('faa_data', {}))
         })
+    # Append new segments and icons to cumulative KML
+    append_to_cumulative_kml(prev, detection)
     generate_kml()
 
 # ----------------------
