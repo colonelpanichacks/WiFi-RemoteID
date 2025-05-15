@@ -241,9 +241,7 @@ def update_detection(detection):
                 requests.post(WEBHOOK_URL, json=detection, timeout=5)
             except Exception as e:
                 logging.error(f"Server webhook error: {e}")
-        return
-
-        # Write to session CSV
+        # Write to session CSV even for no-GPS
         with open(CSV_FILENAME, mode='a', newline='') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=[
                 'timestamp', 'alias', 'mac', 'rssi', 'drone_lat', 'drone_long',
@@ -254,8 +252,8 @@ def update_detection(detection):
                 'alias': ALIASES.get(mac, ''),
                 'mac': mac,
                 'rssi': detection.get('rssi', ''),
-                'drone_lat': detection.get('drone_lat', ''),
-                'drone_long': detection.get('drone_long', ''),
+                'drone_lat': new_drone_lat,
+                'drone_long': new_drone_long,
                 'drone_altitude': detection.get('drone_altitude', ''),
                 'pilot_lat': detection.get('pilot_lat', ''),
                 'pilot_long': detection.get('pilot_long', ''),
@@ -263,7 +261,7 @@ def update_detection(detection):
                 'faa_data': json.dumps(detection.get('faa_data', {}))
             })
 
-        # Append to cumulative CSV
+        # Append to cumulative CSV for no-GPS
         with open(CUMULATIVE_CSV_FILENAME, mode='a', newline='') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=[
                 'timestamp', 'alias', 'mac', 'rssi', 'drone_lat', 'drone_long',
@@ -274,8 +272,8 @@ def update_detection(detection):
                 'alias': ALIASES.get(mac, ''),
                 'mac': mac,
                 'rssi': detection.get('rssi', ''),
-                'drone_lat': detection.get('drone_lat', ''),
-                'drone_long': detection.get('drone_long', ''),
+                'drone_lat': new_drone_lat,
+                'drone_long': new_drone_long,
                 'drone_altitude': detection.get('drone_altitude', ''),
                 'pilot_lat': detection.get('pilot_lat', ''),
                 'pilot_long': detection.get('pilot_long', ''),
@@ -283,11 +281,13 @@ def update_detection(detection):
                 'faa_data': json.dumps(detection.get('faa_data', {}))
             })
 
+        # Cache FAA data even for no-GPS
+        if detection.get('basic_id'):
+            write_to_faa_cache(mac, detection['basic_id'], detection.get('faa_data', {}))
+
         # Update KMLs
         generate_kml()
-        append_to_cumulative_kml(mac, detection)
 
-        # Return so no map marker is created at 0,0
         return
 
     # Otherwise, use the provided non-zero coordinates.
@@ -1623,6 +1623,7 @@ function showTerminalPopup(det, isNew) {
     buttonDiv = `<div><button id="zoomBtn" style="${btnStyle}">Zoom to Drone</button></div>`;
   }
   popup.innerHTML = headerDiv + buttonDiv;
+
   if (buttonDiv) {
     const zoomBtn = popup.querySelector('#zoomBtn');
     zoomBtn.addEventListener('click', () => {
