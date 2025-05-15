@@ -3,6 +3,7 @@ import time
 import json
 import csv
 import logging
+import colorsys 
 import threading
 import subprocess
 import socket
@@ -150,19 +151,36 @@ def write_to_faa_cache(mac, remote_id, faa_data):
 # KML Generation (including FAA data)
 # ----------------------
 def generate_kml():
+    # Build sorted list of all MACs seen so far
+    macs = sorted({d['mac'] for d in detection_history})
+
+    # Dynamically generate one distinct ABGR color per MAC
+    mac_colors = {}
+    n = len(macs) or 1
+    for i, m in enumerate(macs):
+        # evenly‐spaced hue 0.0–1.0
+        h = i / n
+        # full saturation & value → RGB floats 0–1
+        r, g, b = colorsys.hsv_to_rgb(h, 1.0, 1.0)
+        # scale to 0–255 ints
+        ri, gi, bi = int(r*255), int(g*255), int(b*255)
+        # format for KML (ABGR hex, alpha=ff)
+        mac_colors[m] = f"ff{bi:02x}{gi:02x}{ri:02x}"
+
+    # Start KML document template
     kml_lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<kml xmlns="http://www.opengis.net/kml/2.2">',
         '<Document>',
         f'<name>Detections {startup_timestamp}</name>'
     ]
-    # Build a set of all MAC addresses from detection_history
-    macs = sorted({d['mac'] for d in detection_history})
-    for mac in macs:
-        alias = ALIASES.get(mac, '')
-        aliasStr = f"{alias} " if alias else ""
 
-        # Drone flight path
+    for mac in macs:
+        alias = ALIASES.get(mac, "")
+        aliasStr = f"{alias} " if alias else ""
+        color    = mac_colors[mac]
+
+        # --- Drone flight path ---
         drone_coords = [
             f"{d['drone_long']},{d['drone_lat']},0"
             for d in detection_history
@@ -170,11 +188,16 @@ def generate_kml():
         ]
         if drone_coords:
             kml_lines.append(f'<Placemark><name>Drone Path {aliasStr}{mac}</name>')
-            kml_lines.append('<Style><LineStyle><color>ff0000ff</color><width>2</width></LineStyle></Style>')
+            kml_lines.append(
+                f'<Style><LineStyle><color>{color}</color><width>2</width></LineStyle></Style>'
+            )
             kml_lines.append('<LineString><tessellate>1</tessellate>')
-            kml_lines.append(f'<coordinates>{" ".join(drone_coords)}</coordinates></LineString></Placemark>')
+            kml_lines.append(
+                f'<coordinates>{" ".join(drone_coords)}</coordinates>'
+                '</LineString></Placemark>'
+            )
 
-        # Pilot flight path
+        # --- Pilot flight path ---
         pilot_coords = [
             f"{d['pilot_long']},{d['pilot_lat']},0"
             for d in detection_history
@@ -182,36 +205,55 @@ def generate_kml():
         ]
         if pilot_coords:
             kml_lines.append(f'<Placemark><name>Pilot Path {aliasStr}{mac}</name>')
-            kml_lines.append('<Style><LineStyle><color>ff00ff00</color><width>2</width></LineStyle></Style>')
+            kml_lines.append(
+                f'<Style><LineStyle><color>{color}</color><width>2</width></LineStyle></Style>'
+            )
             kml_lines.append('<LineString><tessellate>1</tessellate>')
-            kml_lines.append(f'<coordinates>{" ".join(pilot_coords)}</coordinates></LineString></Placemark>')
+            kml_lines.append(
+                f'<coordinates>{" ".join(pilot_coords)}</coordinates>'
+                '</LineString></Placemark>'
+            )
 
-        # Current position icons
-        det = tracked_pairs.get(mac)
-        if det and det.get("drone_lat") and det.get("drone_long"):
+        # --- Current position icons ---
+        det = tracked_pairs.get(mac, {})
+        # Drone icon
+        if det.get("drone_lat") and det.get("drone_long"):
             kml_lines.append(f'<Placemark><name>Drone {aliasStr}{mac}</name>')
-            kml_lines.append('<Style><IconStyle><scale>1.2</scale>'
-                             '<Icon><href>http://maps.google.com/mapfiles/kml/shapes/heliport.png</href></Icon>'
-                             '</IconStyle></Style>')
-            kml_lines.append(f'<Point><coordinates>{det["drone_long"]},{det["drone_lat"]},0</coordinates></Point>')
+            kml_lines.append(
+                f'<Style><IconStyle><color>{color}</color><scale>1.2</scale>'
+                '<Icon>'
+                  '<href>http://maps.google.com/mapfiles/kml/shapes/heliport.png</href>'
+                '</Icon>'
+                '</IconStyle></Style>'
+            )
+            kml_lines.append(
+                f'<Point><coordinates>{det["drone_long"]},{det["drone_lat"]},0</coordinates></Point>'
+            )
             kml_lines.append('</Placemark>')
-        if det and det.get("pilot_lat") and det.get("pilot_long"):
+        # Pilot icon
+        if det.get("pilot_lat") and det.get("pilot_long"):
             kml_lines.append(f'<Placemark><name>Pilot {aliasStr}{mac}</name>')
-            kml_lines.append('<Style><IconStyle><scale>1.2</scale>'
-                             '<Icon><href>http://maps.google.com/mapfiles/kml/shapes/man.png</href></Icon>'
-                             '</IconStyle></Style>')
-            kml_lines.append(f'<Point><coordinates>{det["pilot_long"]},{det["pilot_lat"]},0</coordinates></Point>')
+            kml_lines.append(
+                f'<Style><IconStyle><color>{color}</color><scale>1.2</scale>'
+                '<Icon>'
+                  '<href>http://maps.google.com/mapfiles/kml/shapes/man.png</href>'
+                '</Icon>'
+                '</IconStyle></Style>'
+            )
+            kml_lines.append(
+                f'<Point><coordinates>{det["pilot_long"]},{det["pilot_lat"]},0</coordinates></Point>'
+            )
             kml_lines.append('</Placemark>')
 
-    # Close KML document
+    # Close document
     kml_lines.append('</Document></kml>')
 
-    # Write both session and cumulative KMLs with full flight paths
+    # Write *both* session and cumulative files with full colored paths+icons
     for fname in (KML_FILENAME, CUMULATIVE_KML_FILENAME):
         with open(fname, "w") as f:
             f.write("\n".join(kml_lines))
-    print("Updated KML files:", KML_FILENAME, CUMULATIVE_KML_FILENAME)
 
+    print("Updated KML files:", KML_FILENAME, CUMULATIVE_KML_FILENAME)
 
 # Generate initial KML so the file exists from startup
 generate_kml()
@@ -1551,9 +1593,21 @@ async function updateAliases() {
 }
 
 function safeSetView(latlng, zoom=18) {
-  let currentZoom = map.getZoom();
-  let newZoom = zoom > currentZoom ? zoom : currentZoom;
-  map.setView(latlng, newZoom);
+  const currentZoom = map.getZoom();
+  // make sure we have a Leaflet LatLng
+  const target = L.latLng(latlng);
+  // if it's already on-screen, do just a small “quarter” zoom
+  if (map.getBounds().contains(target)) {
+    const smallZoom = currentZoom + (zoom - currentZoom) * 0.25;
+    map.flyTo(target, smallZoom, { duration: 0.4 });
+    return;
+  }
+  // otherwise do the full zoom-out + zoom-in
+  const midZoom = Math.max(Math.min(currentZoom, zoom) - 3, 8);
+  map.flyTo(target, midZoom, { duration: 0.3 });
+  setTimeout(() => {
+    map.flyTo(target, zoom, { duration: 0.5 });
+  }, 300);
 }
 
 // Transient terminal-style popup for drone events
@@ -2130,7 +2184,7 @@ document.getElementById("layerSelect").addEventListener("change", function() {
   else if (value === "osmHumanitarian") newLayer = osmHumanitarian;
   else if (value === "cartoPositron") newLayer = cartoPositron;
   else if (value === "cartoDarkMatter") newLayer = cartoDarkMatter;
-  else if (value === "esriWorldImagery") newLayer = esriWorldImagery;
+  else if (value === "esriWorldImagery") nareewLayer = esriWorldImagery;
   else if (value === "esriWorldTopo") newLayer = esriWorldTopo;
   else if (value === "esriDarkGray") newLayer = esriDarkGray;
   else if (value === "openTopoMap") newLayer = openTopoMap;
