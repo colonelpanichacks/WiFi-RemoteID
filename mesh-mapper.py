@@ -1473,12 +1473,32 @@ HTML_PAGE = '''
         Polls detections every second instead of every 100 ms to reduce CPU/battery use in Node Mode
       </div>
     </div>
+    <button id="settingsButton"
+            style="display:block;
+                   width:calc(100% - 16px);
+                   margin:6px 8px;
+                   padding:6px;
+                   border:1px solid lime;
+                   background-color:#333;
+                   color:lime;
+                   font-family:monospace;
+                   font-size:0.9em;
+                   border-radius:5px;
+                   cursor:pointer;"
+            onclick="window.location.href='/select_ports'">
+      Settings
+    </button>
+    <div style="color:#FF00FF; font-family:monospace; font-size:0.75em; text-align:center; margin-top:4px;">
+      Return to port selection and settings screen
+    </div>
   </div>
 </div>
 <div id="serialStatus">
   <!-- USB port statuses will be injected here -->
 </div>
 <script>
+  // Clear any stored trackedPairs to prevent leftover drone artifacts
+  localStorage.removeItem("trackedPairs");
   // Track drones already alerted for no GPS
   const alertedNoGpsDrones = new Set();
   // Round tile positions to integer pixels to eliminate seams
