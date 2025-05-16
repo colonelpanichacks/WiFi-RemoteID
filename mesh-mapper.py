@@ -3263,67 +3263,6 @@ def api_get_faa(identifier):
     return jsonify({'status': 'error', 'message': 'No FAA data found for this identifier'}), 404
 
 
-HTML_TEMPLATE = '''
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Mesh Mapper</title>
-  <style>
-    body { background-color: black; color: lime; font-family: monospace; }
-    .switch { position: relative; display: inline-block; width: 40px; height: 20px; }
-    .switch input { opacity: 0; width: 0; height: 0; }
-    .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #555; transition: .4s; border-radius: 20px; }
-    .slider:before {
-      position: absolute;
-      content: "";
-      height: 16px;
-      width: 16px;
-      left: 2px;
-      top: 50%;
-      background-color: lime;
-      border: 1px solid #9B30FF;
-      transition: .4s;
-      border-radius: 50%;
-      transform: translateY(-50%);
-    }
-    .switch input:checked + .slider { background-color: lime; }
-    .switch input:checked + .slider:before {
-      transform: translateX(20px) translateY(-50%);
-      border: 1px solid #9B30FF;
-    }
-    input[type="text"], input[type="password"] { background-color: #222; color: #FF00FF; border: 1px solid #FF00FF; padding: 4px; }
-    button { padding: 5px; border: 1px solid lime; background: #333; color: lime; border-radius: 5px; font-family: monospace; }
-    input, select, button {
-      text-shadow: none !important;
-      box-shadow: none !important;
-    }
-  </style>
-</head>
-<body>
-  <h1>Mesh Mapper</h1>
-  <div id="downloadSection" style="text-align:center; margin-top:20px;">
-    <button id="downloadCsv">CSV</button>
-    <button id="downloadKml">KML</button>
-    <button id="downloadAliases">Aliases</button>
-    <button id="downloadCumulativeCsv">Cumulative CSV</button>
-    <button id="downloadCumulativeKml">Cumulative KML</button>
-  </div>
-  <script>
-    document.getElementById('downloadCsv').onclick = () => window.location='/download/csv';
-    document.getElementById('downloadKml').onclick = () => window.location='/download/kml';
-    document.getElementById('downloadAliases').onclick = () => window.location='/download/aliases';
-    document.getElementById('downloadCumulativeCsv').onclick = () => window.location='/download/cumulative_detections.csv';
-    document.getElementById('downloadCumulativeKml').onclick = () => window.location='/download/cumulative.kml';
-  </script>
-</body>
-</html>
-'''
 
-
-@app.route('/')
-def index():
-    return HTML_TEMPLATE
 
     
