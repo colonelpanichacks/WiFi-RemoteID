@@ -1497,8 +1497,7 @@ HTML_PAGE = '''
   <!-- USB port statuses will be injected here -->
 </div>
 <script>
-  // Clear any stored trackedPairs to prevent leftover drone artifacts
-  localStorage.removeItem("trackedPairs");
+  // Do not clear trackedPairs; persist across reloads
   // Track drones already alerted for no GPS
   const alertedNoGpsDrones = new Set();
   // Round tile positions to integer pixels to eliminate seams
