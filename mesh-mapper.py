@@ -1498,8 +1498,8 @@ HTML_PAGE = '''
 </div>
 <script>
   // Do not clear trackedPairs; persist across reloads
-  // Track drones already alerted to avoid refiring on reload
-  const alertedDrones = new Set(JSON.parse(localStorage.getItem('alertedDrones') || '[]'));
+  // Track drones already alerted for no GPS
+  const alertedNoGpsDrones = new Set();
   // Round tile positions to integer pixels to eliminate seams
   L.DomUtil.setPosition = (function() {
     var original = L.DomUtil.setPosition;
@@ -1703,8 +1703,6 @@ function safeSetView(latlng, zoom=18) {
 
 // Transient terminal-style popup for drone events
 function showTerminalPopup(det, isNew) {
-  // Prevent refiring popups/webhooks on reload
-  if (alertedDrones.has(det.mac)) return;
   // Remove any existing popup
   const old = document.getElementById('dronePopup');
   if (old) old.remove();
@@ -1821,9 +1819,6 @@ function showTerminalPopup(det, isNew) {
   }
   // --- End webhook logic ---
 
-  // Mark this drone as alerted and persist to localStorage
-  alertedDrones.add(det.mac);
-  localStorage.setItem('alertedDrones', JSON.stringify(Array.from(alertedDrones)));
   document.body.appendChild(popup);
 
   // Auto-remove after 4 seconds
@@ -3265,3 +3260,8 @@ def api_get_faa(identifier):
         if c_mac == identifier:
             return jsonify({'status': 'ok', 'faa_data': faa_data})
     return jsonify({'status': 'error', 'message': 'No FAA data found for this identifier'}), 404
+
+
+
+
+    
