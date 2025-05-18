@@ -1545,6 +1545,15 @@ HTML_PAGE = '''
   // Do not clear trackedPairs; persist across reloads
   // Track drones already alerted for no GPS
   const alertedNoGpsDrones = new Set();
+  // Suppress alerts for any non-GPS drones already in localStorage
+  try {
+    const stored = JSON.parse(localStorage.getItem("trackedPairs") || "{}");
+    Object.entries(stored)
+      .filter(([mac, det]) => !det.drone_lat || !det.drone_long)
+      .forEach(([mac]) => alertedNoGpsDrones.add(mac));
+  } catch (e) {
+    console.error("Failed to initialize alertedNoGpsDrones:", e);
+  }
   // Round tile positions to integer pixels to eliminate seams
   L.DomUtil.setPosition = (function() {
     var original = L.DomUtil.setPosition;
