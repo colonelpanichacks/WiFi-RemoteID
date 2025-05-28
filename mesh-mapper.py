@@ -1545,15 +1545,6 @@ HTML_PAGE = '''
   // Do not clear trackedPairs; persist across reloads
   // Track drones already alerted for no GPS
   const alertedNoGpsDrones = new Set();
-  // Suppress alerts for any non-GPS drones already in localStorage
-  try {
-    const stored = JSON.parse(localStorage.getItem("trackedPairs") || "{}");
-    Object.entries(stored)
-      .filter(([mac, det]) => !det.drone_lat || !det.drone_long)
-      .forEach(([mac]) => alertedNoGpsDrones.add(mac));
-  } catch (e) {
-    console.error("Failed to initialize alertedNoGpsDrones:", e);
-  }
   // Round tile positions to integer pixels to eliminate seams
   L.DomUtil.setPosition = (function() {
     var original = L.DomUtil.setPosition;
@@ -1741,7 +1732,7 @@ function safeSetView(latlng, zoom=18) {
   const currentZoom = map.getZoom();
   // make sure we have a Leaflet LatLng
   const target = L.latLng(latlng);
-  // if it's already on-screen, do just a small “quarter” zoom
+  // if it's already on-screen, do just a small "quarter" zoom
   if (map.getBounds().contains(target)) {
     const smallZoom = currentZoom + (zoom - currentZoom) * 0.25;
     map.flyTo(target, smallZoom, { duration: 0.4 });
@@ -3238,79 +3229,9 @@ def download_cumulative_kml():
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
 
-
-app = Flask(__name__)
-
 # --- FAA Data Cache (simple in-memory for example) ---
 FAA_CACHE = {}  # key: (mac, remote_id) or (mac, ""), value: faa_data dict
 TRACKED_PAIRS = {}  # key: mac, value: dict with at least 'basic_id' and 'faa_data'
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FAA_LOG_FILENAME = os.path.join(BASE_DIR, "faa_log.csv")
-
-# --- FAA Query API Endpoint ---
-@app.route('/api/query_faa', methods=['POST'])
-def api_query_faa():
-    data = request.get_json()
-    mac = data.get("mac")
-    remote_id = data.get("remote_id")
-    if not mac or not remote_id:
-        return jsonify({"status": "error", "message": "Missing mac or remote_id"}), 400
-    # Simulate FAA API query
-    faa_result = {
-        "data": {
-            "items": [
-                {
-                    "makeName": "ExampleMake",
-                    "modelName": "ModelX",
-                    "series": "A1",
-                    "trackingNumber": "123456",
-                    "complianceCategories": "Standard",
-                    "updatedAt": datetime.now().isoformat()
-                }
-            ]
-        }
-    }
-    # Save to cache and tracked_pairs
-    FAA_CACHE[(mac, remote_id)] = faa_result
-    TRACKED_PAIRS[mac] = {"basic_id": remote_id, "faa_data": faa_result}
-    # Log to CSV
-    if FAA_LOG_FILENAME:
-        try:
-            file_exists = os.path.isfile(FAA_LOG_FILENAME)
-            with open(FAA_LOG_FILENAME, "a", newline='') as csvfile:
-                fieldnames = ["timestamp", "mac", "remote_id", "faa_response"]
-                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                if not file_exists:
-                    writer.writeheader()
-                writer.writerow({
-                    "timestamp": datetime.now().isoformat(),
-                    "mac": mac,
-                    "remote_id": remote_id,
-                    "faa_response": json.dumps(faa_result)
-                })
-        except Exception as e:
-            print("Error writing to FAA log CSV:", e)
-    return jsonify({"status": "ok", "faa_data": faa_result})
-
-# --- FAA Data GET API Endpoint (by MAC or basic_id) ---
-@app.route('/api/faa/<identifier>', methods=['GET'])
-def api_get_faa(identifier):
-    """
-    Retrieve cached FAA data by MAC address or by basic_id (remote ID).
-    """
-    # Lookup by MAC in tracked_pairs
-    if identifier in TRACKED_PAIRS and 'faa_data' in TRACKED_PAIRS[identifier]:
-        return jsonify({'status': 'ok', 'faa_data': TRACKED_PAIRS[identifier]['faa_data']})
-    # Lookup by basic_id in tracked_pairs
-    for mac, det in TRACKED_PAIRS.items():
-        if det.get('basic_id') == identifier and 'faa_data' in det:
-            return jsonify({'status': 'ok', 'faa_data': det['faa_data']})
-    # FAA_CACHE search by remote_id then by MAC
-    for (c_mac, c_rid), faa_data in FAA_CACHE.items():
-        if c_rid == identifier:
-            return jsonify({'status': 'ok', 'faa_data': faa_data})
-    for (c_mac, c_rid), faa_data in FAA_CACHE.items():
-        if c_mac == identifier:
-            return jsonify({'status': 'ok', 'faa_data': faa_data})
-    return jsonify({'status': 'error', 'message': 'No FAA data found for this identifier'}), 404
