@@ -2759,9 +2759,12 @@ function updateComboList(data) {
     const color = get_color_for_mac(mac);
     item.style.borderColor = color;
     item.style.color = color;
-    // Mark items seen in the last 5 second
-    const isRecent = detection && ((currentTime - detection.last_update) <= 5);
+    
+    // Only mark items as recent if they are active AND within the last 3 seconds
+    // This prevents flashing on stale drones
+    const isRecent = detection && isActive && ((currentTime - detection.last_update) <= 3);
     item.classList.toggle('recent', isRecent);
+    
     if (isActive) {
       if (item.parentNode !== activePlaceholder) { activePlaceholder.appendChild(item); }
     } else {
@@ -2944,7 +2947,7 @@ async function updateData() {
         if (followLock.enabled && followLock.type === 'pilot' && followLock.id === mac) { map.setView([pilotLat, pilotLng], map.getZoom()); }
       }
       // At end of loop iteration, remember this state for next time
-      previousActive[mac] = validDrone;
+      // previousActive[mac] = validDrone;
     }
     initialLoad = false;
     updateComboList(data);
