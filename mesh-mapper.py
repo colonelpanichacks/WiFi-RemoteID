@@ -5,6 +5,8 @@ import csv
 import logging
 import colorsys
 import threading
+import subprocess
+import socket
 import requests
 import urllib3
 import serial
@@ -13,6 +15,7 @@ import signal
 import sys
 import argparse
 from datetime import datetime, timedelta
+from urllib.parse import urlparse
 from typing import Optional, List
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -24,27 +27,13 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ----------------------
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
+    format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler('mapper.log'),
         logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger(__name__)
-
-# Add a debug mode flag that can be toggled
-DEBUG_MODE = False
-
-def set_debug_mode(enabled=True):
-    """Enable or disable debug logging"""
-    global DEBUG_MODE
-    DEBUG_MODE = enabled
-    if enabled:
-        logging.getLogger().setLevel(logging.DEBUG)
-        logger.info("Debug logging enabled")
-    else:
-        logging.getLogger().setLevel(logging.INFO)
-        logger.info("Debug logging disabled")
 
 # ----------------------
 # Global Configuration
@@ -97,6 +86,7 @@ def set_server_webhook_url(url: str):
     WEBHOOK_URL = url
 
 app = Flask(__name__)
+# Initialize Socket.IO for browser and peer-server synchronization
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -120,6 +110,9 @@ serial_objs = {}
 serial_objs_lock = threading.Lock()
 
 startup_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+# Track when watchdog reset was sent to each port to ignore immediate responses
+last_watchdog_reset = {}
+WATCHDOG_IGNORE_DURATION = 3  # seconds to ignore detections after watchdog reset
 # Updated detections CSV header to include faa_data.
 CSV_FILENAME = os.path.join(BASE_DIR, f"detections_{startup_timestamp}.csv")
 KML_FILENAME = os.path.join(BASE_DIR, f"detections_{startup_timestamp}.kml")
@@ -611,8 +604,6 @@ def update_detection(detection):
 
     if not valid_drone:
         print(f"No-GPS detection for {mac}; forwarding for popup and webhook.")
-        # Set last_update for no-GPS detections so they can be tracked for timeout
-        detection["last_update"] = time.time()
         # Forward this no-GPS detection to the client
         tracked_pairs[mac] = detection
         detection_history.append(detection.copy())
@@ -1132,9 +1123,6 @@ PORT_SELECTION_PAGE = '''
       const url = document.getElementById('webhookUrl').value.trim();
       localStorage.setItem('popupWebhookUrl', url);
       console.log('Webhook URL updated to', url);
-      // Add purple flash effect
-      this.style.backgroundColor = 'purple';
-      setTimeout(() => { this.style.backgroundColor = '#333'; }, 300);
     });
 
   </script>
@@ -1217,8 +1205,9 @@ HTML_PAGE = '''
       background-color: #333;
       color: lime;
       border: none;
-      padding: 2.1px;
-      font-size: 0.7em;
+      padding: 3px;  /* reduced from 6px but still larger than original 2.1px */
+      font-size: 1em;  /* keep larger font */
+      min-width: 160px;  /* keep wide enough */
     }
     
         #filterBox {
@@ -1227,8 +1216,7 @@ HTML_PAGE = '''
           right: 10px;
           background: rgba(0,0,0,0.8);
           padding: 8px;
-          width: 280px;
-          max-width: 25vw;
+          width: 18.75vw;
           border: 1px solid lime;
           border-radius: 10px;
           color: lime;
@@ -1294,18 +1282,23 @@ HTML_PAGE = '''
       color: #FF00FF;
     }
     
-    /* USB status styling - now integrated in filter window */
-    #serialStatus div { margin-bottom: 2px; }
-    #serialStatus div:last-child { margin-bottom: 0; }
-    
-    /* USB status box styling - purple border and black background */
+    /* USB status box styling (bottom right) - now even with the map layer select */
     #serialStatus {
-      background-color: black !important;
+      position: absolute;
+      bottom: 10px;
+      right: 10px;
+      background: rgba(0,0,0,0.8);
+      padding: 3px; /* reduced from 5px */
+      border: 0.7px solid lime; /* reduced border thickness */
+      border-radius: 7px; /* reduced from 10px */
+      color: lime;
+      font-family: monospace;
+      font-size: 0.7em; /* scale font by 70% */
+      z-index: 1000;
     }
-    #serialStatus:parent, div:has(> #serialStatus) {
-      border: 1px solid #FF00FF !important;
-      background-color: black !important;
-    }
+    #serialStatus div { margin-bottom: 5px; }
+    /* Remove extra bottom padding from the last USB item */
+    #serialStatus div:last-child { margin-bottom: 0; }
     
     .usb-name { color: #FF00FF; } /* Neon pink for device names */
     .drone-item {
@@ -1319,27 +1312,26 @@ HTML_PAGE = '''
       position: relative;
       border: 1px solid deepskyblue !important;
     }
-    /* Forcefully disable any tooltips on no-GPS drones */
-    #activePlaceholder .drone-item.no-gps:hover::after,
-    #activePlaceholder .drone-item.no-gps:hover::before {
-      display: none !important;
-      content: none !important;
-      visibility: hidden !important;
+    #activePlaceholder .drone-item.no-gps:hover::after {
+      content: "no gps lock";
+      position: absolute;
+      bottom: 100%;
+      left: 50%;
+      transform: translateX(-50%);
+      background-color: black;
+      color: #FF00FF;               /* neon pink text */
+      padding: 4px 6px;
+      border: 1px solid #FF00FF;    /* neon pink border */
+      border-radius: 2px;
+      white-space: nowrap;
+      font-family: monospace;
+      font-size: 0.75em;
+      z-index: 2000;
     }
     /* Highlight recently seen drones */
     .drone-item.recent {
-      box-shadow: 0 0 0 1px lime !important;
+      box-shadow: 0 0 0 1px lime;
     }
-    /* Remove green box-shadow from no-GPS drones, keep their blue border */
-    .drone-item.recent.no-gps {
-      box-shadow: none !important;
-    }
-    /* DEBUG: Test rule to ensure CSS is working - all drone items should have red background */
-    /*
-    .drone-item {
-      background-color: darkred !important;
-    }
-    */
     .placeholder {
       border: 2px solid transparent;
       border-image: linear-gradient(to right, lime 85%, yellow 15%) 1;
@@ -1695,48 +1687,6 @@ HTML_PAGE = '''
       padding: 4px 6px;
       margin: 2px 4px 2px 0;
     }
-    /* Cumulative download buttons styling to match regular download buttons */
-    #downloadCumulativeButtons button {
-      flex: 1;
-      margin: 0;
-      padding: 4px;
-      font-size: 0.8em;
-      border: 1px solid lime;
-      border-radius: 5px;
-      background-color: #333;
-      color: lime;
-      font-family: monospace;
-      cursor: pointer;
-    }
-    #downloadCumulativeButtons button:focus {
-      outline: none;
-      caret-color: transparent;
-    }
-    /* Highlight recently seen drones */
-    .drone-item.recent {
-      box-shadow: 0 0 0 1px lime !important;
-    }
-    /* Remove green box-shadow from no-GPS drones, keep their blue border */
-    .drone-item.recent.no-gps {
-      box-shadow: none !important;
-    }
-    
-    /* Serial status box styling - purple border and black background */
-    #serialStatus {
-      background-color: black !important;
-      color: #FF00FF !important;
-      font-family: monospace !important;
-      font-size: 0.8em !important;
-      text-align: center !important;
-    }
-    
-    /* Target the parent div containing serialStatus for purple border */
-    div:has(> #serialStatus) {
-      border: 1px solid #FF00FF !important;
-      background-color: black !important;
-      border-radius: 5px !important;
-      padding: 4px 8px !important;
-    }
 </style>
     <style>
       /* Remove glow and shadows on text boxes, selects, and buttons */
@@ -1748,6 +1698,19 @@ HTML_PAGE = '''
 </head>
 <body>
 <div id="map"></div>
+<div id="layerControl">
+  <label>Basemap:</label>
+  <select id="layerSelect">
+    <option value="osmStandard">OSM Standard</option>
+    <option value="osmHumanitarian">OSM Humanitarian</option>
+    <option value="cartoPositron">CartoDB Positron</option>
+    <option value="cartoDarkMatter">CartoDB Dark Matter</option>
+    <option value="esriWorldImagery" selected>Esri World Imagery</option>
+    <option value="esriWorldTopo">Esri World TopoMap</option>
+    <option value="esriDarkGray">Esri Dark Gray Canvas</option>
+    <option value="openTopoMap">OpenTopoMap</option>
+  </select>
+</div>
 <div id="filterBox">
   <div id="filterHeader">
     <h3>Drones</h3>
@@ -1778,23 +1741,9 @@ HTML_PAGE = '''
         <button id="downloadCumulativeKml">Cumulative KML</button>
       </div>
     </div>
-    <!-- Basemap Section -->
-    <div style="margin-top:4px;">
-      <h4 style="margin: 10px 0 5px 0; text-align: center; background: linear-gradient(to right, lime, yellow); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">Basemap</h4>
-      <select id="layerSelect" style="background-color:#333; color:#FF00FF; border:1px solid lime; padding:3px; font-family:monospace; font-size:0.8em; width:42%; max-width:100%; margin:0 auto; display:block;">
-        <option value="osmStandard">OSM Standard</option>
-        <option value="osmHumanitarian">OSM Humanitarian</option>
-        <option value="cartoPositron">CartoDB Positron</option>
-        <option value="cartoDarkMatter">CartoDB Dark Matter</option>
-        <option value="esriWorldImagery" selected>Esri World Imagery</option>
-        <option value="esriWorldTopo">Esri World TopoMap</option>
-        <option value="esriDarkGray">Esri Dark Gray Canvas</option>
-        <option value="openTopoMap">OpenTopoMap</option>
-      </select>
-    </div>
     <!-- Node Mode block -->
-    <div style="margin-top:4px; display:flex; flex-direction:column; align-items:center;">
-      <h4 style="margin: 10px 0 5px 0; text-align: center; background: linear-gradient(to right, lime, yellow); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">Polling Speed</h4>
+    <div style="margin-top:8px; display:flex; flex-direction:column; align-items:center;">
+      <label style="color:lime; font-family:monospace; margin-bottom:4px;">Polling Speed</label>
       <div style="display:flex; align-items:center; gap:8px;">
         <span style="color:#FF00FF; font-family:monospace; font-size:0.8em;">100ms</span>
         <label class="switch">
@@ -1807,7 +1756,7 @@ HTML_PAGE = '''
     <button id="settingsButton"
             style="display:block;
                    width:calc(100% - 16px);
-                   margin:6px 8px 12px 8px;
+                   margin:6px 8px;
                    padding:6px;
                    border:1px solid lime;
                    background-color:#333;
@@ -1819,13 +1768,10 @@ HTML_PAGE = '''
             onclick="window.location.href='/select_ports'">
       Settings
     </button>
-    <!-- USB Status separator box -->
-    <div style="margin-top:8px; width:fit-content; max-width:calc(100% - 16px); margin:8px auto 0 auto; border: 1px solid #FF00FF; background-color: black; padding:2px 8px; display:flex; justify-content:center; align-items:center;">
-      <div id="serialStatus" style="font-family:monospace; font-size:0.8em; text-align:center;">
-        <!-- USB port statuses will be injected here -->
-      </div>
-    </div>
   </div>
+</div>
+<div id="serialStatus">
+  <!-- USB port statuses will be injected here -->
 </div>
 <script>
   // Do not clear trackedPairs; persist across reloads
@@ -2032,17 +1978,8 @@ function safeSetView(latlng, zoom=18) {
   }, 300);
 }
 
-// Global variable to track the current popup timeout
-let currentPopupTimeout = null;
-
 // Transient terminal-style popup for drone events
 function showTerminalPopup(det, isNew) {
-  // Clear any existing timeout first
-  if (currentPopupTimeout) {
-    clearTimeout(currentPopupTimeout);
-    currentPopupTimeout = null;
-  }
-
   // Remove any existing popup
   const old = document.getElementById('dronePopup');
   if (old) old.remove();
@@ -2157,14 +2094,8 @@ function showTerminalPopup(det, isNew) {
 
   document.body.appendChild(popup);
 
-  // Set a new 5-second timeout and store the reference
-  currentPopupTimeout = setTimeout(() => {
-    const popupToRemove = document.getElementById('dronePopup');
-    if (popupToRemove) {
-      popupToRemove.remove();
-    }
-    currentPopupTimeout = null;
-  }, 5000);
+  // Auto-remove after 4 seconds
+  setTimeout(() => popup.remove(), 4000);
 }
 
 var followLock = { type: null, id: null, enabled: false };
@@ -2635,8 +2566,8 @@ document.getElementById("layerSelect").addEventListener("change", function() {
   map.options.maxZoom = maxAllowed;
   localStorage.setItem('basemap', value);
   this.style.backgroundColor = "rgba(0,0,0,0.8)";
-  this.style.color = "#FF00FF";
-  setTimeout(() => { this.style.backgroundColor = "rgba(0,0,0,0.8)"; this.style.color = "#FF00FF"; }, 500);
+  this.style.color = "lime";
+  setTimeout(() => { this.style.backgroundColor = "rgba(0,0,0,0.8)"; this.style.color = "lime"; }, 500);
 });
 
 let persistentMACs = [];
@@ -2794,6 +2725,13 @@ function updateComboList(data) {
     let item = comboListItems[mac];
     if (!item) {
       item = document.createElement("div");
+      // Tooltip for drones without valid GPS
+      const det = data[mac];
+      const hasGps = det && det.drone_lat && det.drone_long && det.drone_lat !== 0 && det.drone_long !== 0;
+      if (!hasGps) {
+        item.classList.add('no-gps');
+        item.setAttribute('data-tooltip', 'awaiting valid gps coordinates');
+      }
       comboListItems[mac] = item;
       item.className = "drone-item";
       item.addEventListener("dblclick", () => {
@@ -2821,26 +2759,8 @@ function updateComboList(data) {
     const color = get_color_for_mac(mac);
     item.style.borderColor = color;
     item.style.color = color;
-    
-    // Handle no-GPS styling with 5-second transmission timeout
-    const det = data[mac];
-    const hasGps = det && det.drone_lat && det.drone_long && det.drone_lat !== 0 && det.drone_long !== 0;
-    const hasRecentTransmission = det && det.last_update && ((currentTime - det.last_update) <= 5);
-    
-    // Debug logging
-    console.log(`MAC: ${mac}, hasGps: ${hasGps}, hasRecentTransmission: ${hasRecentTransmission}, drone_lat: ${det?.drone_lat}, drone_long: ${det?.drone_long}, last_update: ${det?.last_update}, currentTime: ${currentTime}`);
-    
-    // Apply no-GPS styling only if drone has no GPS AND has recent transmission (within 5 seconds)
-    if (!hasGps && hasRecentTransmission) {
-      item.classList.add('no-gps');
-      console.log(`Adding no-gps class to ${mac}`);
-    } else {
-      item.classList.remove('no-gps');
-    }
-    
-    // Mark items seen in the last 5 seconds
-    const isRecent = det && ((currentTime - det.last_update) <= 5);
-    console.log(`MAC: ${mac}, isRecent: ${isRecent}, applying recent class: ${isRecent}`);
+    // Mark items seen in the last 5 second
+    const isRecent = detection && ((currentTime - detection.last_update) <= 5);
     item.classList.toggle('recent', isRecent);
     if (isActive) {
       if (item.parentNode !== activePlaceholder) { activePlaceholder.appendChild(item); }
@@ -2911,48 +2831,16 @@ async function updateData() {
       const isNew     = !seenDrones[mac];
 
       // Only fire popup on transition from inactive to active, after initial load, and within stale threshold
-      // ALSO handle no-GPS drones here in centralized popup logic
-      const hasGps = validDrone || (pilotLat !== 0 && pilotLng !== 0);
-      const hasRecentTransmission = det.last_update && (currentTime - det.last_update <= 5);
-      const isNoGpsDrone = !hasGps && hasRecentTransmission;
-      
-      let shouldShowPopup = false;
-      let popupIsNew = false;
-      
-      if (!initialLoad && det.last_update && (currentTime - det.last_update <= STALE_THRESHOLD)) {
-        // GPS drone popup logic
-        if (!wasActive && activeNow) {
-          shouldShowPopup = true;
-          popupIsNew = alias ? false : !seenDrones[mac];
-        }
-        // No-GPS drone popup logic (centralized here)
-        else if (isNoGpsDrone && !alertedNoGpsDrones.has(mac)) {
-          shouldShowPopup = true;
-          popupIsNew = true;
-        }
-      }
-      
-      if (shouldShowPopup) {
-        showTerminalPopup(det, popupIsNew);
+      if (!initialLoad && det.last_update && (currentTime - det.last_update <= STALE_THRESHOLD) && !wasActive) {
+        showTerminalPopup(det, alias ? false : !seenDrones[mac]);
         seenDrones[mac] = true;
-        if (isNoGpsDrone) {
-          alertedNoGpsDrones.add(mac);
-        }
       }
       // Persist for next update
       previousActive[mac] = activeNow;
 
       const validPilot = (pilotLat !== 0 && pilotLng !== 0);
-      
-      // Handle no-GPS drones that are still transmitting (mapping only, no popup)
-      if (isNoGpsDrone) {
-        // Ensure this MAC is in the persistent list for display
-        if (!persistentMACs.includes(mac)) { persistentMACs.push(mac); }
-      } else if (!hasRecentTransmission) {
-        // Reset alert state when transmission stops
-        alertedNoGpsDrones.delete(mac);
-      }
-      
+      // Allow popups after initial load completes
+      initialLoad = false;
       if (!validDrone && !validPilot) continue;
       const color = get_color_for_mac(mac);
       // First detection zoom block (keep this block only)
@@ -3069,24 +2957,17 @@ async function updateData() {
       const det = data[mac];
       const droneElem = comboListItems[mac];
       if (!droneElem) continue;
-      
-      const hasGps = det.drone_lat && det.drone_long && det.drone_lat !== 0 && det.drone_long !== 0;
-      const hasRecentTransmission = det.last_update && ((currentTime - det.last_update) <= 5);
-      
-      if (!hasGps && hasRecentTransmission) {
-        // Apply no-GPS styling and one-time alert for drones with no GPS but recent transmission
+      if (!det.drone_lat || !det.drone_long || det.drone_lat === 0 || det.drone_long === 0) {
+        // Apply no-GPS styling and one-time alert
         droneElem.classList.add('no-gps');
         if (!alertedNoGpsDrones.has(det.mac)) {
-          // Duplicate alert removed - already handled in main loop
-          // showTerminalPopup(det, true);
+          showTerminalPopup(det, true);
           alertedNoGpsDrones.add(det.mac);
         }
       } else {
-        // Remove no-GPS styling and reset alert state when GPS is acquired or transmission stops
+        // Remove no-GPS styling and reset alert state
         droneElem.classList.remove('no-gps');
-        if (!hasRecentTransmission) {
-          alertedNoGpsDrones.delete(det.mac);
-        }
+        alertedNoGpsDrones.delete(det.mac);
       }
     }
   } catch (error) { console.error("Error fetching detection data:", error); }
@@ -3487,10 +3368,6 @@ def serial_reader(port):
     ser = None
     connection_attempts = 0
     max_connection_attempts = 5
-    data_received_count = 0
-    last_data_time = time.time()
-    
-    logger.info(f"Starting serial reader thread for port: {port}")
     
     while not SHUTDOWN_EVENT.is_set():
         # Try to open or re-open the serial port
@@ -3502,14 +3379,6 @@ def serial_reader(port):
                 logger.info(f"Opened serial port {port} at {BAUD_RATE} baud.")
                 with serial_objs_lock:
                     serial_objs[port] = ser
-                    
-                # Send a test command to wake up the device
-                try:
-                    ser.write(b'WATCHDOG_RESET\n')
-                    logger.debug(f"Sent watchdog reset to {port}")
-                except Exception as e:
-                    logger.warning(f"Failed to send watchdog reset to {port}: {e}")
-                    
             except Exception as e:
                 serial_connected_status[port] = False
                 connection_attempts += 1
@@ -3525,77 +3394,52 @@ def serial_reader(port):
                 continue
 
         try:
-            # Always try to read data, don't rely only on in_waiting
-            line = ser.readline().decode('utf-8', errors='ignore').strip()
-            
-            if line:
-                data_received_count += 1
-                last_data_time = time.time()
-                
-                # Log all received data for debugging (limit length to avoid spam)
-                if data_received_count <= 10 or data_received_count % 50 == 0:
-                    logger.info(f"Data from {port} (#{data_received_count}): {line[:200]}")
-                
+            # Read incoming data
+            if ser.in_waiting:
+                line = ser.readline().decode('utf-8', errors='ignore').strip()
+                if not line:
+                    continue
+                    
                 # JSON extraction and detection handling...
-                json_str = line
                 if '{' in line:
                     json_str = line[line.find('{'):]
+                else:
+                    json_str = line
                     
                 try:
                     detection = json.loads(json_str)
-                    logger.debug(f"Parsed JSON from {port}: {detection}")
+                    # Skip heartbeat messages
+                    if 'heartbeat' in detection:
+                        continue
+                    
+                    # Skip watchdog reset responses and status messages
+                    if any(key in detection for key in ['watchdog', 'status', 'reset', 'initialized']):
+                        logger.debug(f"Skipping watchdog/status message from {port}: {detection}")
+                        continue
                     
                     # MAC tracking logic...
                     if 'mac' in detection:
                         last_mac_by_port[port] = detection['mac']
-                        logger.debug(f"Found MAC in detection: {detection['mac']}")
                     elif port in last_mac_by_port:
                         detection['mac'] = last_mac_by_port[port]
-                        logger.debug(f"Using cached MAC for {port}: {detection['mac']}")
-                    else:
-                        logger.warning(f"No MAC found in detection from {port}: {detection}")
                     
-                    # Skip heartbeat messages
-                    if 'heartbeat' in detection:
-                        logger.debug(f"Skipping heartbeat from {port}")
-                        continue
-                    
-                    # Skip status messages without detection data
-                    if not any(key in detection for key in ['mac', 'drone_lat', 'pilot_lat', 'basic_id', 'remote_id']):
-                        logger.debug(f"Skipping non-detection message from {port}: {detection}")
-                        continue
-                        
                     # Normalize remote_id field
                     if 'remote_id' in detection and 'basic_id' not in detection:
                         detection['basic_id'] = detection['remote_id']
                     
-                    # Add port information for debugging
-                    detection['source_port'] = port
-                    
                     # Process the detection
-                    logger.info(f"Processing detection from {port}: MAC={detection.get('mac', 'N/A')}, "
-                              f"RSSI={detection.get('rssi', 'N/A')}, "
-                              f"Drone GPS=({detection.get('drone_lat', 'N/A')}, {detection.get('drone_long', 'N/A')})")
-                    
                     update_detection(detection)
                     
                     # Log detection in headless mode
                     if HEADLESS_MODE and detection.get('mac'):
-                        logger.info(f"Detection from {port}: MAC {detection['mac']}, "
+                        logger.debug(f"Detection from {port}: MAC {detection['mac']}, "
                                    f"RSSI {detection.get('rssi', 'N/A')}")
                         
                 except json.JSONDecodeError as e:
-                    # Log non-JSON data for debugging
-                    logger.debug(f"Non-JSON data from {port}: {line[:100]}")
+                    logger.debug(f"JSON decode error on {port}: {e} - Line: {line[:100]}")
                     continue
             else:
-                # Short sleep when no data
                 time.sleep(0.1)
-                
-                # Log if we haven't received data in a while
-                if time.time() - last_data_time > 30:  # 30 seconds
-                    logger.warning(f"No data received from {port} for {int(time.time() - last_data_time)} seconds")
-                    last_data_time = time.time()  # Reset timer to avoid spam
                 
         except (serial.SerialException, OSError) as e:
             serial_connected_status[port] = False
@@ -3622,8 +3466,6 @@ def serial_reader(port):
             with serial_objs_lock:
                 serial_objs.pop(port, None)
             time.sleep(1)
-    
-    logger.info(f"Serial reader thread for {port} shutting down. Total data packets received: {data_received_count}")
 
 def start_serial_thread(port):
     thread = threading.Thread(target=serial_reader, args=(port,), daemon=True)
@@ -3765,7 +3607,8 @@ def main():
     
     # Configure logging level
     if args.debug:
-        set_debug_mode(True)
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.info("Debug logging enabled")
     
     logger.info(f"Starting Drone Mapper...")
     logger.info(f"Headless mode: {HEADLESS_MODE}")
@@ -3797,75 +3640,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-@app.route('/api/diagnostics', methods=['GET'])
-def api_diagnostics():
-    """Provide detailed diagnostic information for troubleshooting"""
-    diagnostics = {
-        "timestamp": datetime.now().isoformat(),
-        "selected_ports": SELECTED_PORTS,
-        "serial_status": serial_connected_status,
-        "tracked_pairs": len(tracked_pairs),
-        "detection_history_count": len(detection_history),
-        "last_mac_by_port": last_mac_by_port,
-        "available_ports": [{"device": p.device, "description": p.description} 
-                           for p in serial.tools.list_ports.comports()],
-        "active_serial_objects": list(serial_objs.keys()) if serial_objs else [],
-        "headless_mode": HEADLESS_MODE,
-        "auto_start_enabled": AUTO_START_ENABLED,
-        "shutdown_event_set": SHUTDOWN_EVENT.is_set(),
-        "debug_mode": DEBUG_MODE
-    }
-    
-    # Add recent detections if any exist
-    if detection_history:
-        recent_detections = detection_history[-5:]  # Last 5 detections
-        diagnostics["recent_detections"] = [
-            {
-                "mac": d.get("mac", "N/A"),
-                "timestamp": d.get("last_update", "N/A"),
-                "source_port": d.get("source_port", "N/A"),
-                "drone_coords": f"({d.get('drone_lat', 'N/A')}, {d.get('drone_long', 'N/A')})",
-                "rssi": d.get("rssi", "N/A")
-            }
-            for d in recent_detections
-        ]
-    else:
-        diagnostics["recent_detections"] = []
-    
-    return jsonify(diagnostics)
-
-@app.route('/api/debug_mode', methods=['POST'])
-def api_toggle_debug():
-    """Toggle debug mode on/off"""
-    data = request.get_json() or {}
-    enabled = data.get('enabled', not DEBUG_MODE)
-    set_debug_mode(enabled)
-    return jsonify({"debug_mode": DEBUG_MODE, "message": f"Debug mode {'enabled' if DEBUG_MODE else 'disabled'}"})
-
-@app.route('/api/send_command', methods=['POST'])
-def api_send_command():
-    """Send a test command to serial ports for debugging"""
-    data = request.get_json()
-    command = data.get('command', 'WATCHDOG_RESET')
-    port = data.get('port')  # Optional: send to specific port
-    
-    results = {}
-    
-    with serial_objs_lock:
-        ports_to_send = [port] if port and port in serial_objs else list(serial_objs.keys())
-        
-        for p in ports_to_send:
-            try:
-                ser = serial_objs.get(p)
-                if ser and ser.is_open:
-                    ser.write(f'{command}\n'.encode())
-                    results[p] = "Command sent successfully"
-                    logger.info(f"Sent command '{command}' to {p}")
-                else:
-                    results[p] = "Port not open or not available"
-            except Exception as e:
-                results[p] = f"Error: {str(e)}"
-                logger.error(f"Failed to send command to {p}: {e}")
-    
-    return jsonify({"command": command, "results": results})
