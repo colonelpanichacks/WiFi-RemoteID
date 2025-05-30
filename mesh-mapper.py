@@ -17,6 +17,7 @@ from typing import Optional, List
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from flask import Flask, request, jsonify, redirect, url_for, render_template, render_template_string, send_file
+from flask_socketio import SocketIO, emit
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ----------------------
@@ -95,10 +96,100 @@ WEBHOOK_URL = None
 def set_server_webhook_url(url: str):
     global WEBHOOK_URL
     WEBHOOK_URL = url
+    save_webhook_url()  # Save to disk whenever URL is updated
 
 app = Flask(__name__)
+socketio = SocketIO(app, cors_allowed_origins="*")  # Enable Socket.IO
+
+# Define emit_serial_status early to avoid NameError in threads
+def emit_serial_status():
+    try:
+        socketio.emit('serial_status', serial_connected_status, )
+    except Exception as e:
+        logger.debug(f"Error emitting serial status: {e}")
+        pass  # Ignore if no clients connected or serialization error
+
+def emit_aliases():
+    try:
+        socketio.emit('aliases', ALIASES, )
+    except Exception as e:
+        logger.debug(f"Error emitting aliases: {e}")
+
+def emit_detections():
+    try:
+        # Convert tracked_pairs to a JSON-serializable format
+        serializable_pairs = {}
+        for key, value in tracked_pairs.items():
+            # Ensure key is a string
+            str_key = str(key)
+            # Ensure value is JSON-serializable
+            if isinstance(value, dict):
+                serializable_pairs[str_key] = value
+            else:
+                serializable_pairs[str_key] = str(value)
+        socketio.emit('detections', serializable_pairs, )
+    except Exception as e:
+        logger.debug(f"Error emitting detections: {e}")
+
+def emit_paths():
+    try:
+        socketio.emit('paths', get_paths_for_emit(), )
+    except Exception as e:
+        logger.debug(f"Error emitting paths: {e}")
+
+def emit_cumulative_log():
+    try:
+        socketio.emit('cumulative_log', get_cumulative_log_for_emit(), )
+    except Exception as e:
+        logger.debug(f"Error emitting cumulative log: {e}")
+
+def emit_faa_cache():
+    try:
+        # Convert FAA_CACHE to JSON-serializable format
+        serializable_cache = {}
+        for key, value in FAA_CACHE.items():
+            # Convert tuple keys to strings
+            str_key = str(key) if isinstance(key, tuple) else key
+            serializable_cache[str_key] = value
+        socketio.emit('faa_cache', serializable_cache, )
+    except Exception as e:
+        logger.debug(f"Error emitting FAA cache: {e}")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# ----------------------
+# Webhook URL Persistence (must be early in file)
+# ----------------------
+WEBHOOK_URL_FILE = os.path.join(BASE_DIR, "webhook_url.json")
+
+def save_webhook_url():
+    """Save the current webhook URL to disk"""
+    global WEBHOOK_URL
+    try:
+        with open(WEBHOOK_URL_FILE, "w") as f:
+            json.dump({"webhook_url": WEBHOOK_URL}, f)
+        logger.debug(f"Webhook URL saved to {WEBHOOK_URL_FILE}")
+    except Exception as e:
+        logger.error(f"Error saving webhook URL: {e}")
+
+def load_webhook_url():
+    """Load the webhook URL from disk on startup"""
+    global WEBHOOK_URL
+    if os.path.exists(WEBHOOK_URL_FILE):
+        try:
+            with open(WEBHOOK_URL_FILE, "r") as f:
+                data = json.load(f)
+                WEBHOOK_URL = data.get("webhook_url", None)
+                if WEBHOOK_URL:
+                    logger.info(f"Loaded saved webhook URL: {WEBHOOK_URL}")
+                else:
+                    logger.info("No webhook URL found in saved file")
+        except Exception as e:
+            logger.error(f"Error loading webhook URL: {e}")
+            WEBHOOK_URL = None
+    else:
+        logger.info("No saved webhook URL file found")
+        WEBHOOK_URL = None
 
 # ----------------------
 # Global Variables & Files
@@ -282,6 +373,10 @@ def monitor_ports():
                     if port not in current_ports and serial_connected_status.get(port, False):
                         logger.warning(f"Port {port} disconnected")
                         serial_connected_status[port] = False
+                        
+                        # Broadcast the updated status immediately
+                        emit_serial_status()
+                        
                         with serial_objs_lock:
                             if port in serial_objs:
                                 try:
@@ -331,16 +426,42 @@ def start_status_logging():
         status_thread.start()
         logger.info("Status logging thread started")
 
+def start_websocket_broadcaster():
+    """Start background task to broadcast WebSocket updates every 2 seconds"""
+    def broadcaster():
+        while not SHUTDOWN_EVENT.is_set():
+            try:
+                # Emit all data types every 2 seconds
+                emit_detections()
+                emit_serial_status()
+                emit_paths()
+                emit_aliases()
+                emit_cumulative_log()
+                emit_faa_cache()
+            except Exception as e:
+                # Ignore errors if no clients connected
+                pass
+            
+            # Wait 2 seconds before next broadcast
+            for _ in range(20):  # 20 * 0.1 = 2 seconds, but check shutdown every 0.1s
+                if SHUTDOWN_EVENT.is_set():
+                    break
+                time.sleep(0.1)
+    
+    broadcaster_thread = threading.Thread(target=broadcaster, daemon=True)
+    broadcaster_thread.start()
+    logger.info("WebSocket broadcaster thread started")
+
 # ----------------------
 # FAA Cache Persistence
 # ----------------------
-FAA_CACHE_FILE = os.path.join(BASE_DIR, "faa_cache.csv")
+FAA_CACHE_FILENAME = os.path.join(BASE_DIR, "faa_cache.csv")
 FAA_CACHE = {}
 
-# Load FAA cache from file
-if os.path.exists(FAA_CACHE_FILE):
+# Load FAA cache from disk if it exists
+if os.path.exists(FAA_CACHE_FILENAME):
     try:
-        with open(FAA_CACHE_FILE, newline='') as csvfile:
+        with open(FAA_CACHE_FILENAME, newline='') as csvfile:
             reader = csv.DictReader(csvfile)
             for row in reader:
                 key = (row['mac'], row['remote_id'])
@@ -352,8 +473,8 @@ def write_to_faa_cache(mac, remote_id, faa_data):
     key = (mac, remote_id)
     FAA_CACHE[key] = faa_data
     try:
-        file_exists = os.path.isfile(FAA_CACHE_FILE)
-        with open(FAA_CACHE_FILE, "a", newline='') as csvfile:
+        file_exists = os.path.isfile(FAA_CACHE_FILENAME)
+        with open(FAA_CACHE_FILENAME, "a", newline='') as csvfile:
             fieldnames = ["mac", "remote_id", "faa_response"]
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             if not file_exists:
@@ -416,10 +537,10 @@ def generate_kml():
                         kml_lines.append(f'<Placemark><Style><LineStyle><color>{color}</color><width>2</width></LineStyle></Style><LineString><tessellate>1</tessellate><coordinates>{coords}</coordinates></LineString></Placemark>')
                         # drone start icon
                         start_lon, start_lat, start_ts = current_flight[0]
-                        kml_lines.append(f'<Placemark><name>Drone Start {flight_idx} {aliasStr}{mac}</name><Style><IconStyle><color>{color}</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/airports.png</href></Icon></IconStyle></Style><Point><coordinates>{start_lon},{start_lat},0</coordinates></Point></Placemark>')
+                        kml_lines.append(f'<Placemark><name>Drone Start {flight_idx} {aliasStr}{mac}</name><Style><IconStyle><color>{color}</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/airports.png</href></IconStyle></Style><Point><coordinates>{start_lon},{start_lat},0</coordinates></Point></Placemark>')
                         # drone end icon
                         end_lon, end_lat, end_ts = current_flight[-1]
-                        kml_lines.append(f'<Placemark><name>Drone End {flight_idx} {aliasStr}{mac}</name><Style><IconStyle><color>{color}</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/heliport.png</href></Icon></IconStyle></Style><Point><coordinates>{end_lon},{end_lat},0</coordinates></Point></Placemark>')
+                        kml_lines.append(f'<Placemark><name>Drone End {flight_idx} {aliasStr}{mac}</name><Style><IconStyle><color>{color}</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/heliport.png</href></IconStyle></Style><Point><coordinates>{end_lon},{end_lat},0</coordinates></Point></Placemark>')
                         # pilot path inside same flight
                         start_ts = current_flight[0][2]
                         pilot_pts = [(d['pilot_long'], d['pilot_lat']) for d in detection_history if d.get('mac')==mac and d.get('pilot_lat') and d.get('pilot_long') and d.get('last_update')>=start_ts and d.get('last_update')<=end_ts]
@@ -427,7 +548,7 @@ def generate_kml():
                             pc = " ".join(f"{p[0]},{p[1]},0" for p in pilot_pts)
                             kml_lines.append(f'<Placemark><name>Pilot Path {flight_idx} {aliasStr}{mac}</name><Style><LineStyle><color>{color}</color><width>2</width><gx:dash/></LineStyle></Style><LineString><tessellate>1</tessellate><coordinates>{pc}</coordinates></LineString></Placemark>')
                             plon, plat = pilot_pts[-1]
-                            kml_lines.append(f'<Placemark><name>Pilot End {flight_idx} {aliasStr}{mac}</name><Style><IconStyle><color>{color}</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/man.png</href></Icon></IconStyle></Style><Point><coordinates>{plon},{plat},0</coordinates></Point></Placemark>')
+                            kml_lines.append(f'<Placemark><name>Pilot End {flight_idx} {aliasStr}{mac}</name><Style><IconStyle><color>{color}</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/man.png</href></IconStyle></Style><Point><coordinates>{plon},{plat},0</coordinates></Point></Placemark>')
                         kml_lines.append('</Folder>')
                         flight_idx += 1
                     current_flight = []
@@ -445,15 +566,15 @@ def generate_kml():
             kml_lines.append(f'<Placemark><Style><LineStyle><color>{color}</color><width>2</width></LineStyle></Style><LineString><tessellate>1</tessellate><coordinates>{coords}</coordinates></LineString></Placemark>')
             # drone start icon
             start_lon, start_lat, start_ts = current_flight[0]
-            kml_lines.append(f'<Placemark><name>Drone Start {flight_idx} {aliasStr}{mac}</name><Style><IconStyle><color>{color}</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/airports.png</href></Icon></IconStyle></Style><Point><coordinates>{start_lon},{start_lat},0</coordinates></Point></Placemark>')
+            kml_lines.append(f'<Placemark><name>Drone Start {flight_idx} {aliasStr}{mac}</name><Style><IconStyle><color>{color}</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/airports.png</href></IconStyle></Style><Point><coordinates>{start_lon},{start_lat},0</coordinates></Point></Placemark>')
             end_lon, end_lat, end_ts = current_flight[-1]
-            kml_lines.append(f'<Placemark><name>Drone End {flight_idx} {aliasStr}{mac}</name><Style><IconStyle><color>{color}</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/heliport.png</href></Icon></IconStyle></Style><Point><coordinates>{end_lon},{end_lat},0</coordinates></Point></Placemark>')
+            kml_lines.append(f'<Placemark><name>Drone End {flight_idx} {aliasStr}{mac}</name><Style><IconStyle><color>{color}</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/heliport.png</href></IconStyle></Style><Point><coordinates>{end_lon},{end_lat},0</coordinates></Point></Placemark>')
             pilot_pts = [(d['pilot_long'], d['pilot_lat']) for d in detection_history if d.get('mac')==mac and d.get('pilot_lat') and d.get('pilot_long') and d.get('last_update')>=current_flight[0][2] and d.get('last_update')<=end_ts]
             if pilot_pts:
                 pc = " ".join(f"{p[0]},{p[1]},0" for p in pilot_pts)
                 kml_lines.append(f'<Placemark><name>Pilot Path {flight_idx} {aliasStr}{mac}</name><Style><LineStyle><color>{color}</color><width>2</width><gx:dash/></LineStyle></Style><LineString><tessellate>1</tessellate><coordinates>{pc}</coordinates></LineString></Placemark>')
                 plon, plat = pilot_pts[-1]
-                kml_lines.append(f'<Placemark><name>Pilot End {flight_idx} {aliasStr}{mac}</name><Style><IconStyle><color>{color}</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/man.png</href></Icon></IconStyle></Style><Point><coordinates>{plon},{plat},0</coordinates></Point></Placemark>')
+                kml_lines.append(f'<Placemark><name>Pilot End {flight_idx} {aliasStr}{mac}</name><Style><IconStyle><color>{color}</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/man.png</href></IconStyle></Style><Point><coordinates>{plon},{plat},0</coordinates></Point></Placemark>')
             kml_lines.append('</Folder>')
     # Close document
     kml_lines.append('</Document></kml>')
@@ -538,10 +659,10 @@ def generate_cumulative_kml():
                         kml_lines.append(f'<Placemark><Style><LineStyle><color>{color}</color><width>2</width></LineStyle></Style><LineString><tessellate>1</tessellate><coordinates>{coords}</coordinates></LineString></Placemark>')
                         # drone start icon
                         start_lo, start_la, start_ts = current_flight[0]
-                        kml_lines.append(f'<Placemark><name>Drone Start {flight_idx} {aliasStr}{mac}</name><Style><IconStyle><color>{color}</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/airports.png</href></Icon></IconStyle></Style><Point><coordinates>{start_lo},{start_la},0</coordinates></Point></Placemark>')
+                        kml_lines.append(f'<Placemark><name>Drone Start {flight_idx} {aliasStr}{mac}</name><Style><IconStyle><color>{color}</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/airports.png</href></IconStyle></Style><Point><coordinates>{start_lo},{start_la},0</coordinates></Point></Placemark>')
                         # drone end icon
                         end_lo, end_la, end_ts = current_flight[-1]
-                        kml_lines.append(f'<Placemark><name>Drone End {flight_idx} {aliasStr}{mac}</name><Style><IconStyle><color>{color}</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/heliport.png</href></Icon></IconStyle></Style><Point><coordinates>{end_lo},{end_la},0</coordinates></Point></Placemark>')
+                        kml_lines.append(f'<Placemark><name>Drone End {flight_idx} {aliasStr}{mac}</name><Style><IconStyle><color>{color}</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/heliport.png</href></IconStyle></Style><Point><coordinates>{end_lo},{end_la},0</coordinates></Point></Placemark>')
                         # pilot path
                         start_ts = current_flight[0][2]
                         pilot_pts = [(d['pilot_long'], d['pilot_lat']) for d in history if d.get('mac')==mac and d.get('pilot_lat') and d.get('pilot_long') and start_ts <= d['last_update'] <= end_ts]
@@ -549,7 +670,7 @@ def generate_cumulative_kml():
                             pc = " ".join(f"{plo},{pla},0" for plo, pla in pilot_pts)
                             kml_lines.append(f'<Placemark><name>Pilot Path {flight_idx} {aliasStr}{mac}</name><Style><LineStyle><color>{color}</color><width>2</width><gx:dash/></LineStyle></Style><LineString><tessellate>1</tessellate><coordinates>{pc}</coordinates></LineString></Placemark>')
                             plon, plat = pilot_pts[-1]
-                            kml_lines.append(f'<Placemark><name>Pilot End {flight_idx} {aliasStr}{mac}</name><Style><IconStyle><color>{color}</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/man.png</href></Icon></IconStyle></Style><Point><coordinates>{plon},{plat},0</coordinates></Point></Placemark>')
+                            kml_lines.append(f'<Placemark><name>Pilot End {flight_idx} {aliasStr}{mac}</name><Style><IconStyle><color>{color}</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/man.png</href></IconStyle></Style><Point><coordinates>{plon},{plat},0</coordinates></Point></Placemark>')
                         # close folder
                         kml_lines.append('</Folder>')
                         flight_idx += 1
@@ -569,16 +690,16 @@ def generate_cumulative_kml():
             kml_lines.append(f'<Placemark><Style><LineStyle><color>{color}</color><width>2</width></LineStyle></Style><LineString><tessellate>1</tessellate><coordinates>{coords}</coordinates></LineString></Placemark>')
             # drone start icon
             start_lo, start_la, start_ts = current_flight[0]
-            kml_lines.append(f'<Placemark><name>Drone Start {flight_idx} {aliasStr}{mac}</name><Style><IconStyle><color>{color}</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/airports.png</href></Icon></IconStyle></Style><Point><coordinates>{start_lo},{start_la},0</coordinates></Point></Placemark>')
+            kml_lines.append(f'<Placemark><name>Drone Start {flight_idx} {aliasStr}{mac}</name><Style><IconStyle><color>{color}</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/airports.png</href></IconStyle></Style><Point><coordinates>{start_lo},{start_la},0</coordinates></Point></Placemark>')
             end_lo, end_la, end_ts = current_flight[-1]
-            kml_lines.append(f'<Placemark><name>Drone End {flight_idx} {aliasStr}{mac}</name><Style><IconStyle><color>{color}</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/heliport.png</href></Icon></IconStyle></Style><Point><coordinates>{end_lo},{end_la},0</coordinates></Point></Placemark>')
+            kml_lines.append(f'<Placemark><name>Drone End {flight_idx} {aliasStr}{mac}</name><Style><IconStyle><color>{color}</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/heliport.png</href></IconStyle></Style><Point><coordinates>{end_lo},{end_la},0</coordinates></Point></Placemark>')
             start_ts = current_flight[0][2]
             pilot_pts = [(d['pilot_long'], d['pilot_lat']) for d in history if d.get('mac')==mac and d.get('pilot_lat') and d.get('pilot_long') and start_ts <= d['last_update'] <= end_ts]
             if pilot_pts:
                 pc = " ".join(f"{plo},{pla},0" for plo, pla in pilot_pts)
                 kml_lines.append(f'<Placemark><name>Pilot Path {flight_idx} {aliasStr}{mac}</name><Style><LineStyle><color>{color}</color><width>2</width><gx:dash/></LineStyle></Style><LineString><tessellate>1</tessellate><coordinates>{pc}</coordinates></LineString></Placemark>')
                 plon, plat = pilot_pts[-1]
-                kml_lines.append(f'<Placemark><name>Pilot End {flight_idx} {aliasStr}{mac}</name><Style><IconStyle><color>{color}</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/man.png</href></Icon></IconStyle></Style><Point><coordinates>{plon},{plat},0</coordinates></Point></Placemark>')
+                kml_lines.append(f'<Placemark><name>Pilot End {flight_idx} {aliasStr}{mac}</name><Style><IconStyle><color>{color}</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/man.png</href></IconStyle></Style><Point><coordinates>{plon},{plat},0</coordinates></Point></Placemark>')
             kml_lines.append('</Folder>')
 
     # Close document
@@ -610,18 +731,44 @@ def update_detection(detection):
     valid_drone = (new_drone_lat != 0 and new_drone_long != 0)
 
     if not valid_drone:
-        print(f"No-GPS detection for {mac}; forwarding for popup and webhook.")
+        print(f"No-GPS detection for {mac}; forwarding for processing.")
         # Set last_update for no-GPS detections so they can be tracked for timeout
         detection["last_update"] = time.time()
+        
+        # Preserve previous basic_id if new detection lacks one (same logic as GPS section)
+        if not detection.get("basic_id") and mac in tracked_pairs and tracked_pairs[mac].get("basic_id"):
+            detection["basic_id"] = tracked_pairs[mac]["basic_id"]
+        
+        # Comprehensive FAA data persistence logic for no-GPS detections
+        remote_id = detection.get("basic_id")
+        if mac:
+            # Exact match if basic_id provided
+            if remote_id:
+                key = (mac, remote_id)
+                if key in FAA_CACHE:
+                    detection["faa_data"] = FAA_CACHE[key]
+            # Fallback: any cached FAA data for this mac (regardless of basic_id)
+            if "faa_data" not in detection:
+                for (c_mac, _), faa_data in FAA_CACHE.items():
+                    if c_mac == mac:
+                        detection["faa_data"] = faa_data
+                        break
+            # Fallback: last known FAA data in tracked_pairs
+            if "faa_data" not in detection and mac in tracked_pairs and "faa_data" in tracked_pairs[mac]:
+                detection["faa_data"] = tracked_pairs[mac]["faa_data"]
+            # Always cache FAA data by MAC and current basic_id for future lookups
+            if "faa_data" in detection:
+                write_to_faa_cache(mac, detection.get("basic_id", ""), detection["faa_data"])
+        
         # Forward this no-GPS detection to the client
         tracked_pairs[mac] = detection
         detection_history.append(detection.copy())
-        # Server-side webhook firing for no-GPS detection
-        if WEBHOOK_URL:
-            try:
-                requests.post(WEBHOOK_URL, json=detection, timeout=5)
-            except Exception as e:
-                logging.error(f"Server webhook error: {e}")
+        
+        # Backend webhook logic for all detections (GPS and no-GPS) - enabled
+        should_trigger, is_new = should_trigger_webhook_earliest(detection, mac)
+        if should_trigger:
+            trigger_backend_webhook_earliest(detection, is_new)
+        
         # Write to session CSV even for no-GPS
         with open(CSV_FILENAME, mode='a', newline='') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=[
@@ -703,9 +850,15 @@ def update_detection(detection):
             write_to_faa_cache(mac, detection.get("basic_id", ""), detection["faa_data"])
 
     tracked_pairs[mac] = detection
+    
+    # Backend webhook logic for GPS detections - enabled
+    should_trigger, is_new = should_trigger_webhook_earliest(detection, mac)
+    if should_trigger:
+        trigger_backend_webhook_earliest(detection, is_new)
+    
     # Broadcast this detection to all connected clients and peer servers
     try:
-        socketio.emit('detection', detection, broadcast=True)
+        socketio.emit('detection', detection, )
     except Exception:
         pass
     detection_history.append(detection.copy())
@@ -750,12 +903,167 @@ def update_detection(detection):
     # Regenerate full cumulative KML
     generate_cumulative_kml()
     generate_kml()
+    
+    # Emit real-time updates via WebSocket (if available in this context)
+    try:
+        emit_detections()
+        emit_paths()
+        emit_cumulative_log()
+        emit_faa_cache()
+    except NameError:
+        # Emit functions not available in this thread context
+        pass
+    except Exception as e:
+        # Handle JSON serialization errors gracefully
+        logger.debug(f"WebSocket emit error: {e}")
+        pass
 
 # ----------------------
 # Global Follow Lock & Color Overrides
 # ----------------------
 followLock = {"type": None, "id": None, "enabled": False}
 colorOverrides = {}
+
+# Backend webhook tracking variables
+backend_seen_drones = set()
+backend_previous_active = {}
+backend_alerted_no_gps = set()
+
+# ----------------------
+# Webhook Functions (EARLY DEFINITION - must be before update_detection)
+# ----------------------
+
+def should_trigger_webhook_earliest(detection, mac):
+    """
+    Determine if a webhook should be triggered based on the same logic as frontend popups.
+    Returns (should_trigger, is_new_detection)
+    """
+    global backend_seen_drones, backend_previous_active, backend_alerted_no_gps
+    
+    current_time = time.time()
+    
+    # Debug logging
+    logging.debug(f"Webhook check for {mac}: detection={detection}")
+    logging.debug(f"Webhook check: current_time={current_time}, last_update={detection.get('last_update')}")
+    
+    # Check if detection is within stale threshold (30 seconds)
+    if not detection.get('last_update') or (current_time - detection['last_update'] > 30):
+        logging.debug(f"Webhook check for {mac}: FAILED stale check - last_update={detection.get('last_update')}")
+        return False, False
+    
+    # GPS drone logic
+    drone_lat = detection.get('drone_lat', 0)
+    drone_long = detection.get('drone_long', 0)
+    pilot_lat = detection.get('pilot_lat', 0) 
+    pilot_long = detection.get('pilot_long', 0)
+    
+    valid_drone = (drone_lat != 0 and drone_long != 0)
+    has_gps = valid_drone or (pilot_lat != 0 and pilot_long != 0)
+    has_recent_transmission = detection.get('last_update') and (current_time - detection['last_update'] <= 5)
+    is_no_gps_drone = not has_gps and has_recent_transmission
+    
+    # Calculate state
+    active_now = valid_drone and detection.get('last_update') and (current_time - detection['last_update'] <= 30)
+    was_active = backend_previous_active.get(mac, False)
+    is_new = mac not in backend_seen_drones
+    
+    logging.debug(f"Webhook check for {mac}: valid_drone={valid_drone}, active_now={active_now}, was_active={was_active}, is_new={is_new}")
+    
+    should_trigger = False
+    popup_is_new = False
+    
+    # GPS drone webhook logic - trigger on transition from inactive to active
+    if not was_active and active_now:
+        should_trigger = True
+        alias = ALIASES.get(mac)
+        popup_is_new = not alias and is_new
+        logging.info(f"Webhook trigger for {mac}: GPS drone transition to active")
+    
+    # No-GPS drone webhook logic - trigger once per detection session
+    elif is_no_gps_drone and mac not in backend_alerted_no_gps:
+        should_trigger = True
+        popup_is_new = True
+        backend_alerted_no_gps.add(mac)
+        logging.info(f"Webhook trigger for {mac}: No-GPS drone detected")
+    
+    logging.debug(f"Webhook check for {mac}: should_trigger={should_trigger}, popup_is_new={popup_is_new}")
+    
+    # Update tracking state
+    if should_trigger:
+        backend_seen_drones.add(mac)
+    backend_previous_active[mac] = active_now
+    
+    # Clean up no-GPS alerts when transmission stops
+    if not has_recent_transmission:
+        backend_alerted_no_gps.discard(mac)
+    
+    return should_trigger, popup_is_new
+
+def trigger_backend_webhook_earliest(detection, is_new_detection):
+    """
+    Send webhook with same payload format as frontend popups
+    """
+    logging.info(f"Backend webhook called for {detection.get('mac')} - WEBHOOK_URL: {WEBHOOK_URL}")
+    
+    if not WEBHOOK_URL or not WEBHOOK_URL.startswith("http"):
+        logging.warning(f"Backend webhook skipped - invalid URL: {WEBHOOK_URL}")
+        return
+    
+    try:
+        mac = detection.get('mac')
+        alias = ALIASES.get(mac) if mac else None
+        
+        # Determine header message (same logic as frontend)
+        if not detection.get('drone_lat') or not detection.get('drone_long') or detection.get('drone_lat') == 0 or detection.get('drone_long') == 0:
+            header = 'Drone with no GPS lock detected'
+        elif alias:
+            header = f'Known drone detected – {alias}'
+        else:
+            header = 'New drone detected' if is_new_detection else 'Previously seen non-aliased drone detected'
+        
+        logging.info(f"Backend webhook for {mac}: {header}")
+        
+        # Build payload (same format as frontend)
+        payload = {
+            'alert': header,
+            'mac': mac,
+            'basic_id': detection.get('basic_id'),
+            'alias': alias,
+            'drone_lat': detection.get('drone_lat') if detection.get('drone_lat') != 0 else None,
+            'drone_long': detection.get('drone_long') if detection.get('drone_long') != 0 else None,
+            'pilot_lat': detection.get('pilot_lat') if detection.get('pilot_lat') != 0 else None,
+            'pilot_long': detection.get('pilot_long') if detection.get('pilot_long') != 0 else None,
+            'faa_data': None,  # Will be populated below
+            'drone_gmap': None,
+            'pilot_gmap': None,
+            'isNew': is_new_detection
+        }
+        
+        # Add FAA data if available
+        faa_data = detection.get('faa_data')
+        if faa_data and isinstance(faa_data, dict) and faa_data.get('data') and isinstance(faa_data['data'].get('items'), list) and len(faa_data['data']['items']) > 0:
+            payload['faa_data'] = faa_data['data']['items'][0]
+        
+        # Add Google Maps links
+        if payload['drone_lat'] and payload['drone_long']:
+            payload['drone_gmap'] = f"https://www.google.com/maps?q={payload['drone_lat']},{payload['drone_long']}"
+        if payload['pilot_lat'] and payload['pilot_long']:
+            payload['pilot_gmap'] = f"https://www.google.com/maps?q={payload['pilot_lat']},{payload['pilot_long']}"
+        
+        # Send webhook
+        logging.info(f"Sending webhook to {WEBHOOK_URL} with payload: {payload}")
+        response = requests.post(WEBHOOK_URL, json=payload, timeout=10)
+        logging.info(f"Backend webhook sent for {mac}: {response.status_code}")
+        
+    except requests.exceptions.Timeout:
+        logging.error(f"Backend webhook timeout for {detection.get('mac', 'unknown')}: URL {WEBHOOK_URL} timed out after 10 seconds")
+    except requests.exceptions.ConnectionError as e:
+        logging.error(f"Backend webhook connection error for {detection.get('mac', 'unknown')}: Unable to reach {WEBHOOK_URL} - {e}")
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Backend webhook request error for {detection.get('mac', 'unknown')}: {e}")
+    except Exception as e:
+        logging.error(f"Backend webhook error for {detection.get('mac', 'unknown')}: {e}")
+
 
 # ----------------------
 # FAA Query Helper Functions
@@ -824,8 +1132,17 @@ def webhook_popup():
         return jsonify({"status": "error", "reason": "No webhook URL provided"}), 400
     try:
         clean_data = data.get("payload", {})
-        response = requests.post(webhook_url, json=clean_data, timeout=5)
+        response = requests.post(webhook_url, json=clean_data, timeout=10)
         return jsonify({"status": "ok", "response": response.status_code}), 200
+    except requests.exceptions.Timeout:
+        logging.error(f"Webhook timeout for URL: {webhook_url}")
+        return jsonify({"status": "error", "message": "Webhook request timed out after 10 seconds"}), 408
+    except requests.exceptions.ConnectionError as e:
+        logging.error(f"Webhook connection error for URL {webhook_url}: {e}")
+        return jsonify({"status": "error", "message": f"Connection error: Unable to reach webhook URL"}), 503
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Webhook request error for URL {webhook_url}: {e}")
+        return jsonify({"status": "error", "message": f"Request error: {str(e)}"}), 500
     except Exception as e:
         logging.error(f"Webhook send error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -1046,16 +1363,16 @@ PORT_SELECTION_PAGE = '''
     </select><br>
     <div style="margin-bottom:8px;"></div>
     <div style="margin-top:4px; margin-bottom:4px; text-align:center;">
-      <label for="webhookUrl" style="font-size:18px; font-family:'Orbitron', monospace; color:#87CEEB;">Webhook URL</label><br>
+      <label for="webhookUrl" style="font-size:18px; font-family:'Orbitron', monospace; color:#87CEEB;">Webhook URL (Backend)</label><br>
       <input type="text" id="webhookUrl" placeholder="https://example.com/webhook"
-             style="width:300px; background-color:#222; color:#87CEEB; border:1px solid #FF00FF; padding:4px; font-size:1em; outline:none;">
-    </div>
-    <div style="margin-top:4px; margin-bottom:4px; text-align:center;">
+             style="font-family:'Orbitron', monospace; color:#87CEEB; background-color:#222; border:1px solid #FF00FF; width:100%; font-size:16px; padding:4px;">
+      <br><br>
       <button id="updateWebhookButton" style="border:1px solid lime; background-color:#333; color:#FF00FF; font-family:'Orbitron',monospace; padding:4px 8px; cursor:pointer; border-radius:4px;">
         Update Webhook
       </button>
     </div>
-    <button id="beginMapping" type="submit" style="
+    <div style="margin-top:4px; margin-bottom:4px; text-align:center;">
+      <button id="beginMapping" type="submit" style="
         display: block;
         margin: 15px auto 0;
         padding: 8px 15px;
@@ -1122,21 +1439,111 @@ PORT_SELECTION_PAGE = '''
       setTimeout(loadSelectedPorts, 100);
     }
     const webhookInput = document.getElementById('webhookUrl');
-    const storedWebhookUrl = localStorage.getItem('popupWebhookUrl') || '';
-    webhookInput.value = storedWebhookUrl;
-    webhookInput.addEventListener('change', () => {
-      localStorage.setItem('popupWebhookUrl', webhookInput.value.trim());
-    });
-    document.getElementById('updateWebhookButton').addEventListener('click', function(e) {
+    
+    // Load current webhook URL from backend on page load
+    loadCurrentWebhookUrl();
+    
+    async function loadCurrentWebhookUrl() {
+      try {
+        const response = await fetch('/api/get_webhook_url');
+        const result = await response.json();
+        console.log('Webhook URL load result:', result);
+        if (result.status === 'ok') {
+          document.getElementById('webhookUrl').value = result.webhook_url || '';
+          console.log('Webhook URL loaded:', result.webhook_url || '(empty)');
+        } else {
+          console.warn('Failed to load webhook URL:', result.message);
+        }
+      } catch (e) {
+        console.warn('Could not load webhook URL:', e);
+      }
+    }
+    
+    document.getElementById('updateWebhookButton').addEventListener('click', async function(e) {
       e.preventDefault();
       const url = document.getElementById('webhookUrl').value.trim();
-      localStorage.setItem('popupWebhookUrl', url);
-      console.log('Webhook URL updated to', url);
-      // Add purple flash effect
-      this.style.backgroundColor = 'purple';
-      setTimeout(() => { this.style.backgroundColor = '#333'; }, 300);
+      const button = this;
+      
+      try {
+        // Send webhook URL update via API
+        const response = await fetch('/api/set_webhook_url', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ webhook_url: url })
+        });
+        
+        const result = await response.json();
+        
+        if (result.status === 'ok') {
+          // Flash purple to indicate success
+          const originalStyle = button.style.cssText;
+          button.style.backgroundColor = '#9B30FF';
+          button.style.borderColor = '#9B30FF';
+          button.style.color = 'white';
+          button.style.textShadow = '0 0 8px #9B30FF';
+          
+          // Also update the hidden input for when Begin Mapping is clicked
+          let webhookInput = document.getElementById('hiddenWebhookUrl');
+          if (!webhookInput) {
+            webhookInput = document.createElement('input');
+            webhookInput.type = 'hidden';
+            webhookInput.id = 'hiddenWebhookUrl';
+            webhookInput.name = 'webhook_url';
+            document.querySelector('form').appendChild(webhookInput);
+          }
+          webhookInput.value = url;
+          
+          // Reset button style after flash
+          setTimeout(() => {
+            button.style.cssText = originalStyle;
+          }, 300);
+          
+        } else {
+          console.error('Error updating webhook:', result.message);
+          // Flash red for error
+          const originalStyle = button.style.cssText;
+          button.style.backgroundColor = '#ff0000';
+          button.style.borderColor = '#ff0000';
+          button.style.color = 'white';
+          
+          setTimeout(() => {
+            button.style.cssText = originalStyle;
+          }, 300);
+        }
+      } catch (error) {
+        console.error('Error updating webhook:', error);
+        // Flash red for error
+        const originalStyle = button.style.cssText;
+        button.style.backgroundColor = '#ff0000';
+        button.style.borderColor = '#ff0000';
+        button.style.color = 'white';
+        
+        setTimeout(() => {
+          button.style.cssText = originalStyle;
+        }, 300);
+      }
     });
 
+    // Ensure webhook URL is included when Begin Mapping form is submitted
+    document.getElementById('beginMapping').addEventListener('click', function(e) {
+      const url = document.getElementById('webhookUrl').value.trim();
+      
+      // Add webhook URL to the form as a hidden input
+      const form = document.querySelector('form');
+      let webhookInput = document.getElementById('hiddenWebhookUrl');
+      if (!webhookInput) {
+        webhookInput = document.createElement('input');
+        webhookInput.type = 'hidden';
+        webhookInput.id = 'hiddenWebhookUrl';
+        webhookInput.name = 'webhook_url';
+        form.appendChild(webhookInput);
+      }
+      webhookInput.value = url;
+      
+      // Let the form submit normally
+    });
   </script>
 </body>
 </html>
@@ -1150,6 +1557,8 @@ HTML_PAGE = '''
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Mesh Mapper</title>
+  <!-- Add Socket.IO client script for real-time updates -->
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
   <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&display=swap" rel="stylesheet">
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
@@ -1310,24 +1719,24 @@ HTML_PAGE = '''
       position: relative;
       border: 1px solid deepskyblue !important;
     }
-    #activePlaceholder .drone-item.no-gps:hover::after {
+    /* #activePlaceholder .drone-item.no-gps:hover::after {
       content: "no gps lock";
       position: absolute;
       bottom: 100%;
       left: 50%;
       transform: translateX(-50%);
       background-color: black;
-      color: #FF00FF;               /* neon pink text */
+      color: #FF00FF;
       padding: 4px 6px;
-      border: 1px solid #FF00FF;    /* neon pink border */
+      border: 1px solid #FF00FF;
       border-radius: 2px;
       white-space: nowrap;
       font-family: monospace;
       font-size: 0.75em;
       z-index: 2000;
-    }
-    /* Highlight recently seen drones */
-    .drone-item.recent {
+    } */
+    /* Highlight recently seen drones (but not no-GPS drones) */
+    .drone-item.recent:not(.no-gps) {
       box-shadow: 0 0 0 1px lime;
     }
     .placeholder {
@@ -1746,7 +2155,7 @@ HTML_PAGE = '''
     <!-- Basemap Section -->
     <div style="margin-top:4px;">
       <h4 style="margin: 10px 0 5px 0; text-align: center; background: linear-gradient(to right, lime, yellow); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">Basemap</h4>
-      <select id="layerSelect" style="background-color:#333; color:#FF00FF; border:1px solid lime; padding:3px; font-family:monospace; font-size:0.8em; width:42%; max-width:100%; margin:0 auto; display:block;">
+      <select id="layerSelect" style="background-color:rgba(51,51,51,0.7); color:#FF00FF; border:1px solid lime; padding:3px; font-family:monospace; font-size:0.8em; width:fit-content; max-width:calc(100% - 16px); margin:0 auto; display:block; text-align:center; text-align-last:center;">
         <option value="osmStandard">OSM Standard</option>
         <option value="osmHumanitarian">OSM Humanitarian</option>
         <option value="cartoPositron">CartoDB Positron</option>
@@ -1757,22 +2166,10 @@ HTML_PAGE = '''
         <option value="openTopoMap">OpenTopoMap</option>
       </select>
     </div>
-    <!-- Node Mode block -->
-    <div style="margin-top:4px; display:flex; flex-direction:column; align-items:center;">
-      <h4 style="margin: 10px 0 5px 0; text-align: center; background: linear-gradient(to right, lime, yellow); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">Polling Speed</h4>
-      <div style="display:flex; align-items:center; gap:8px;">
-        <span style="color:#FF00FF; font-family:monospace; font-size:0.8em;">100ms</span>
-        <label class="switch">
-          <input type="checkbox" id="nodeModeMainSwitch">
-          <span class="slider"></span>
-        </label>
-        <span style="color:#FF00FF; font-family:monospace; font-size:0.8em;">1s</span>
-      </div>
-    </div>
     <button id="settingsButton"
             style="display:block;
                    width:calc(100% - 16px);
-                   margin:6px 8px 12px 8px;
+                   margin:16px 8px 12px 8px;
                    padding:6px;
                    border:1px solid lime;
                    background-color:#333;
@@ -1784,10 +2181,10 @@ HTML_PAGE = '''
             onclick="window.location.href='/select_ports'">
       Settings
     </button>
-    <!-- USB Status separator box -->
-    <div style="margin-top:8px; width:fit-content; max-width:calc(100% - 16px); margin:8px auto 0 auto; border: 1px solid #87CEEB; padding:2px 8px; display:flex; justify-content:center; align-items:center;">
-      <div id="serialStatus" style="font-family:monospace; font-size:0.8em; text-align:center;">
-        <!-- USB port statuses will be injected here -->
+    <!-- USB Status display with modern styling -->
+    <div style="margin-top:8px; width:fit-content; max-width:calc(100% - 16px); margin:8px auto 0 auto; border: 1px solid purple; background: black; padding:4px 8px; display:flex; justify-content:center; align-items:center;">
+      <div id="serialStatus" style="font-family:monospace; font-size:0.7em; text-align:center; line-height:1.2em;">
+        <!-- USB port statuses will be injected here via WebSocket -->
       </div>
     </div>
   </div>
@@ -1804,6 +2201,77 @@ HTML_PAGE = '''
       original.call(this, el, rounded);
     };
   })();
+
+// --- Socket.IO real-time updates ---
+const socket = io();
+
+// On connect, optionally log or show status
+socket.on('connected', function(data) {
+  console.log(data.message);
+});
+
+// Listen for real-time detection events (single detection)
+socket.on('detection', function(detection) {
+  if (!window.tracked_pairs) window.tracked_pairs = {};
+  window.tracked_pairs[detection.mac] = detection;
+  localStorage.setItem("trackedPairs", JSON.stringify(window.tracked_pairs));
+  updateComboList(window.tracked_pairs);
+  updateAliases();
+  // ... update markers, popups, etc. ...
+});
+
+// Listen for full detections state
+socket.on('detections', function(allDetections) {
+  window.tracked_pairs = allDetections;
+  localStorage.setItem("trackedPairs", JSON.stringify(window.tracked_pairs));
+  updateComboList(window.tracked_pairs);
+  updateAliases();
+  // ... update markers, popups, etc. ...
+});
+
+// Listen for real-time serial status events
+socket.on('serial_status', function(statuses) {
+  const statusDiv = document.getElementById('serialStatus');
+  statusDiv.innerHTML = "";
+  if (statuses) {
+    for (const port in statuses) {
+      const div = document.createElement("div");
+      div.innerHTML = '<span class="usb-name">' + port + '</span>: ' +
+        (statuses[port] ? '<span style="color: lime;">Connected</span>' : '<span style="color: red;">Disconnected</span>');
+      statusDiv.appendChild(div);
+    }
+  }
+});
+
+// Listen for real-time aliases updates
+socket.on('aliases', function(newAliases) {
+  aliases = newAliases;
+  updateComboList(window.tracked_pairs);
+});
+
+// Listen for real-time paths updates
+socket.on('paths', function(paths) {
+  // Update dronePaths and pilotPaths, redraw polylines, etc.
+  // You may want to call restorePaths() or similar logic here
+  // ...
+});
+
+// Listen for real-time cumulative log updates
+socket.on('cumulative_log', function(log) {
+  // Optionally update UI with new log data
+  // ...
+});
+
+// Listen for real-time FAA cache updates
+socket.on('faa_cache', function(faaCache) {
+  // Optionally update UI with new FAA data
+  // ...
+});
+
+// Remove all polling for detections, serial status, aliases, paths, cumulative log, FAA cache, etc.
+// All UI updates are now handled by Socket.IO events above.
+// ... existing code ...
+
 // --- Node Mode Main Switch & Polling Interval Sync ---
 document.addEventListener('DOMContentLoaded', () => {
   // Restore filter collapsed state
@@ -2081,43 +2549,8 @@ function showTerminalPopup(det, isNew) {
     });
   }
   // --- Webhook logic (scoped, non-intrusive) ---
-  try {
-    const webhookUrl = localStorage.getItem('popupWebhookUrl');
-    if (webhookUrl && webhookUrl.startsWith("http")) {
-      const alias = aliases[det.mac];
-      let header;
-      if (!det.drone_lat || !det.drone_long || det.drone_lat === 0 || det.drone_long === 0) {
-        header = 'Drone with no GPS lock detected';
-      } else if (alias) {
-        header = `Known drone detected – ${alias}`;
-      } else {
-        header = isNew ? 'New drone detected' : 'Previously seen non-aliased drone detected';
-      }
-      const payload = {
-        alert: header,
-        mac: det.mac,
-        basic_id: det.basic_id || null,
-        alias: alias || null,
-        drone_lat: det.drone_lat || null,
-        drone_long: det.drone_long || null,
-        pilot_lat: det.pilot_lat || null,
-        pilot_long: det.pilot_long || null,
-        faa_data: (det.faa_data && det.faa_data.data && Array.isArray(det.faa_data.data.items) && det.faa_data.data.items.length > 0)
-          ? det.faa_data.data.items[0]
-          : null,
-        drone_gmap: det.drone_lat && det.drone_long ? `https://www.google.com/maps?q=${det.drone_lat},${det.drone_long}` : null,
-        pilot_gmap: det.pilot_lat && det.pilot_long ? `https://www.google.com/maps?q=${det.pilot_lat},${det.pilot_long}` : null,
-        isNew: isNew
-      };
-      fetch('/api/webhook_popup', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ payload, webhook_url: webhookUrl })
-      }).catch(e => console.warn('Silent webhook fail:', e));
-    }
-  } catch (e) {
-    console.warn('Webhook logic skipped due to error', e);
-  }
+  // Webhooks are now handled automatically by the backend
+  // Backend triggers webhooks using the same detection logic as these popups
   // --- End webhook logic ---
 
   document.body.appendChild(popup);
@@ -3246,26 +3679,69 @@ def select_ports_get():
 def select_ports_post():
     global SELECTED_PORTS
     # Get up to 3 ports; ignore empty values
+    new_selected_ports = {}
     for i in range(1, 4):
         port = request.form.get(f'port{i}')
         if port:
-            SELECTED_PORTS[f'port{i}'] = port
+            new_selected_ports[f'port{i}'] = port
+
+    # Handle webhook URL setting
+    webhook_url = request.form.get('webhook_url', '').strip()
+    try:
+        if webhook_url and not webhook_url.startswith(('http://', 'https://')):
+            logger.warning(f"Invalid webhook URL format: {webhook_url}")
+        else:
+            set_server_webhook_url(webhook_url)
+            if webhook_url:
+                logger.info(f"Webhook URL updated to: {webhook_url}")
+            else:
+                logger.info("Webhook URL cleared")
+    except Exception as e:
+        logger.error(f"Error setting webhook URL: {e}")
+
+    # Close connections to ports that are no longer selected
+    with serial_objs_lock:
+        for port_key, port_device in SELECTED_PORTS.items():
+            if port_key not in new_selected_ports or new_selected_ports[port_key] != port_device:
+                # This port is no longer selected or changed, close its connection
+                if port_device in serial_objs:
+                    try:
+                        ser = serial_objs[port_device]
+                        if ser and ser.is_open:
+                            ser.close()
+                            logger.info(f"Closed serial connection to {port_device}")
+                    except Exception as e:
+                        logger.error(f"Error closing serial connection to {port_device}: {e}")
+                    finally:
+                        serial_objs.pop(port_device, None)
+                        serial_connected_status[port_device] = False
+    
+    # Update selected ports
+    SELECTED_PORTS = new_selected_ports
 
     # Save selected ports for auto-connection on restart
     save_selected_ports()
 
-    # Start serial-reader threads for selected ports
+    # Start serial-reader threads ONLY for newly selected ports
     for port in SELECTED_PORTS.values():
-        serial_connected_status[port] = False
-        start_serial_thread(port)
-    # Send watchdog reset to each microcontroller over USB
+        # Only start thread if port is not already connected
+        if not serial_connected_status.get(port, False):
+            serial_connected_status[port] = False
+            start_serial_thread(port)
+            logger.info(f"Started new serial thread for {port}")
+        else:
+            logger.debug(f"Port {port} already connected, skipping thread creation")
+    
+    # Send watchdog reset to each connected microcontroller over USB
+    time.sleep(1)  # Give new connections time to establish
     with serial_objs_lock:
-        for ser in serial_objs.values():
+        for port, ser in serial_objs.items():
             try:
-                ser.write(b'WATCHDOG_RESET\n')
+                if ser and ser.is_open:
+                    ser.write(b'WATCHDOG_RESET\n')
+                    logger.debug(f"Sent watchdog reset to {port}")
             except Exception as e:
-                logging.error(f"Failed to send watchdog reset: {e}")
-
+                logger.error(f"Failed to send watchdog reset to {port}: {e}")
 
     # Redirect to main page
     return redirect(url_for('index'))
@@ -3463,10 +3939,16 @@ def serial_reader(port):
                 with serial_objs_lock:
                     serial_objs[port] = ser
                     
-                # Send a test command to wake up the device
+                # Broadcast the updated status immediately
+                emit_serial_status()
+                    
+                # Send a test command to wake up the device (reduce frequency to prevent disconnects)
                 try:
-                    ser.write(b'WATCHDOG_RESET\n')
-                    logger.debug(f"Sent watchdog reset to {port}")
+                    # Only send watchdog reset once, not continuously
+                    if connection_attempts == 0:  # Only on first successful connection
+                        time.sleep(0.5)  # Small delay before sending command
+                        ser.write(b'WATCHDOG_RESET\n')
+                        logger.debug(f"Sent initial watchdog reset to {port}")
                 except Exception as e:
                     logger.warning(f"Failed to send watchdog reset to {port}: {e}")
                     
@@ -3474,6 +3956,9 @@ def serial_reader(port):
                 serial_connected_status[port] = False
                 connection_attempts += 1
                 logger.error(f"Error opening serial port {port} (attempt {connection_attempts}): {e}")
+                
+                # Broadcast the updated status immediately
+                emit_serial_status()
                 
                 # If we've failed too many times, wait longer before retrying
                 if connection_attempts >= max_connection_attempts:
@@ -3554,12 +4039,16 @@ def serial_reader(port):
                 
                 # Log if we haven't received data in a while
                 if time.time() - last_data_time > 30:  # 30 seconds
-                    logger.warning(f"No data received from {port} for {int(time.time() - last_data_time)} seconds")
+                    # logger.warning(f"No data received from {port} for {int(time.time() - last_data_time)} seconds")
                     last_data_time = time.time()  # Reset timer to avoid spam
                 
         except (serial.SerialException, OSError) as e:
             serial_connected_status[port] = False
             logger.error(f"SerialException/OSError on {port}: {e}")
+            
+            # Broadcast the updated status immediately
+            emit_serial_status()
+            
             try:
                 if ser and ser.is_open:
                     ser.close()
@@ -3573,6 +4062,10 @@ def serial_reader(port):
         except Exception as e:
             serial_connected_status[port] = False
             logger.error(f"Unexpected error on {port}: {e}")
+            
+            # Broadcast the updated status immediately
+            emit_serial_status()
+            
             try:
                 if ser and ser.is_open:
                     ser.close()
@@ -3640,6 +4133,10 @@ def startup_auto_connect():
     logger.info("Loading previously saved ports...")
     load_selected_ports()
     
+    # Load webhook URL
+    logger.info("Loading previously saved webhook URL...")
+    # load_webhook_url()  # Temporarily disabled - will be called later
+    
     if SELECTED_PORTS:
         logger.info(f"Found saved ports: {list(SELECTED_PORTS.values())}")
         auto_connected = auto_connect_to_saved_ports()
@@ -3659,6 +4156,7 @@ def startup_auto_connect():
     # Start monitoring and status logging
     start_port_monitoring()
     start_status_logging()
+    start_websocket_broadcaster()
     
     logger.info("=== STARTUP COMPLETE ===")
 
@@ -3727,6 +4225,19 @@ def main():
     if args.debug:
         set_debug_mode(True)
     
+    # Load webhook URL (now that all functions are defined)
+    load_webhook_url()
+    
+    # Clean session state to prevent lingering from prior sessions
+    global backend_seen_drones, backend_previous_active, backend_alerted_no_gps
+    global tracked_pairs, detection_history
+    backend_seen_drones.clear()
+    backend_previous_active.clear()
+    backend_alerted_no_gps.clear()
+    tracked_pairs.clear()
+    detection_history.clear()
+    logger.info("Session state cleared - fresh session initialized")
+    
     logger.info(f"Starting Drone Mapper...")
     logger.info(f"Headless mode: {HEADLESS_MODE}")
     logger.info(f"Auto-start enabled: {AUTO_START_ENABLED}")
@@ -3749,14 +4260,13 @@ def main():
         logger.info(f"Starting web interface on port {args.web_port}")
         logger.info(f"Access the interface at: http://localhost:{args.web_port}")
         try:
-            app.run(host='0.0.0.0', port=args.web_port, debug=False)
+            # Use SocketIO to run the app
+            socketio.run(app, host='0.0.0.0', port=args.web_port, debug=False)
         except KeyboardInterrupt:
             logger.info("Received keyboard interrupt")
         finally:
             signal_handler(signal.SIGTERM, None)
 
-if __name__ == '__main__':
-    main()
 
 @app.route('/api/diagnostics', methods=['GET'])
 def api_diagnostics():
@@ -3829,3 +4339,519 @@ def api_send_command():
                 logger.error(f"Failed to send command to {p}: {e}")
     
     return jsonify({"command": command, "results": results})
+
+# --- SocketIO connection event ---
+@socketio.on('connect')
+def handle_connect():
+    logger.debug("Client connected via WebSocket")
+    # Send current state to newly connected client
+    emit_detections()
+    emit_aliases()
+    emit_serial_status()
+    emit_paths()
+    emit_cumulative_log()
+    emit_faa_cache()
+
+# Helper functions to emit all real-time data
+
+def emit_serial_status():
+    try:
+        socketio.emit('serial_status', serial_connected_status, )
+    except Exception as e:
+        logger.debug(f"Error emitting serial status: {e}")
+        pass  # Ignore if no clients connected or serialization error
+
+def emit_aliases():
+    try:
+        socketio.emit('aliases', ALIASES, )
+    except Exception as e:
+        logger.debug(f"Error emitting aliases: {e}")
+
+def emit_detections():
+    try:
+        # Convert tracked_pairs to a JSON-serializable format
+        serializable_pairs = {}
+        for key, value in tracked_pairs.items():
+            # Ensure key is a string
+            str_key = str(key)
+            # Ensure value is JSON-serializable
+            if isinstance(value, dict):
+                serializable_pairs[str_key] = value
+            else:
+                serializable_pairs[str_key] = str(value)
+        socketio.emit('detections', serializable_pairs, )
+    except Exception as e:
+        logger.debug(f"Error emitting detections: {e}")
+
+def emit_paths():
+    try:
+        socketio.emit('paths', get_paths_for_emit(), )
+    except Exception as e:
+        logger.debug(f"Error emitting paths: {e}")
+
+def emit_cumulative_log():
+    try:
+        socketio.emit('cumulative_log', get_cumulative_log_for_emit(), )
+    except Exception as e:
+        logger.debug(f"Error emitting cumulative log: {e}")
+
+def emit_faa_cache():
+    try:
+        # Convert FAA_CACHE to JSON-serializable format
+        serializable_cache = {}
+        for key, value in FAA_CACHE.items():
+            # Convert tuple keys to strings
+            str_key = str(key) if isinstance(key, tuple) else key
+            serializable_cache[str_key] = value
+        socketio.emit('faa_cache', serializable_cache, )
+    except Exception as e:
+        logger.debug(f"Error emitting FAA cache: {e}")
+
+# Helper to get paths for emit
+
+def get_paths_for_emit():
+    drone_paths = {}
+    pilot_paths = {}
+    for det in detection_history:
+        mac = det.get("mac")
+        if not mac:
+            continue
+        d_lat = det.get("drone_lat", 0)
+        d_long = det.get("drone_long", 0)
+        if d_lat != 0 and d_long != 0:
+            drone_paths.setdefault(mac, []).append([d_lat, d_long])
+        p_lat = det.get("pilot_lat", 0)
+        p_long = det.get("pilot_long", 0)
+        if p_lat != 0 and p_long != 0:
+            pilot_paths.setdefault(mac, []).append([p_lat, p_long])
+    def dedupe(path):
+        if not path:
+            return path
+        new_path = [path[0]]
+        for point in path[1:]:
+            if point != new_path[-1]:
+                new_path.append(point)
+        return new_path
+    for mac in drone_paths: drone_paths[mac] = dedupe(drone_paths[mac])
+    for mac in pilot_paths: pilot_paths[mac] = dedupe(pilot_paths[mac])
+    return {"dronePaths": drone_paths, "pilotPaths": pilot_paths}
+
+# Helper to get cumulative log for emit
+
+def get_cumulative_log_for_emit():
+    # Read the cumulative CSV and return as a list of dicts
+    cumulative_log = []
+    if os.path.exists(CUMULATIVE_CSV_FILENAME):
+        try:
+            with open(CUMULATIVE_CSV_FILENAME, 'r', newline='') as csvfile:
+                reader = csv.DictReader(csvfile)
+                for row in reader:
+                    cumulative_log.append(row)
+        except Exception as e:
+            print(f"Error reading cumulative CSV for emit: {e}")
+    return cumulative_log
+
+# ----------------------
+# Backend Webhook State Tracking
+# ----------------------
+backend_seen_drones = set()
+backend_previous_active = {}
+backend_alerted_no_gps = set()
+
+def should_trigger_webhook_earliest(detection, mac):
+    """
+    Determine if a webhook should be triggered based on the same logic as frontend popups.
+    Returns (should_trigger, is_new_detection)
+    """
+    global backend_seen_drones, backend_previous_active, backend_alerted_no_gps
+    
+    current_time = time.time()
+    
+    # Debug logging
+    logging.debug(f"Webhook check for {mac}: detection={detection}")
+    logging.debug(f"Webhook check: current_time={current_time}, last_update={detection.get('last_update')}")
+    
+    # Check if detection is within stale threshold (30 seconds)
+    if not detection.get('last_update') or (current_time - detection['last_update'] > 30):
+        logging.debug(f"Webhook check for {mac}: FAILED stale check - last_update={detection.get('last_update')}")
+        return False, False
+    
+    # GPS drone logic
+    drone_lat = detection.get('drone_lat', 0)
+    drone_long = detection.get('drone_long', 0)
+    pilot_lat = detection.get('pilot_lat', 0) 
+    pilot_long = detection.get('pilot_long', 0)
+    
+    valid_drone = (drone_lat != 0 and drone_long != 0)
+    has_gps = valid_drone or (pilot_lat != 0 and pilot_long != 0)
+    has_recent_transmission = detection.get('last_update') and (current_time - detection['last_update'] <= 5)
+    is_no_gps_drone = not has_gps and has_recent_transmission
+    
+    # Calculate state
+    active_now = valid_drone and detection.get('last_update') and (current_time - detection['last_update'] <= 30)
+    was_active = backend_previous_active.get(mac, False)
+    is_new = mac not in backend_seen_drones
+    
+    logging.debug(f"Webhook check for {mac}: valid_drone={valid_drone}, active_now={active_now}, was_active={was_active}, is_new={is_new}")
+    
+    should_trigger = False
+    popup_is_new = False
+    
+    # GPS drone webhook logic - trigger on transition from inactive to active
+    if not was_active and active_now:
+        should_trigger = True
+        alias = ALIASES.get(mac)
+        popup_is_new = not alias and is_new
+        logging.info(f"Webhook trigger for {mac}: GPS drone transition to active")
+    
+    # No-GPS drone webhook logic - trigger once per detection session
+    elif is_no_gps_drone and mac not in backend_alerted_no_gps:
+        should_trigger = True
+        popup_is_new = True
+        backend_alerted_no_gps.add(mac)
+        logging.info(f"Webhook trigger for {mac}: No-GPS drone detected")
+    
+    logging.debug(f"Webhook check for {mac}: should_trigger={should_trigger}, popup_is_new={popup_is_new}")
+    
+    # Update tracking state
+    if should_trigger:
+        backend_seen_drones.add(mac)
+    backend_previous_active[mac] = active_now
+    
+    # Clean up no-GPS alerts when transmission stops
+    if not has_recent_transmission:
+        backend_alerted_no_gps.discard(mac)
+    
+    return should_trigger, popup_is_new
+
+def trigger_backend_webhook_earliest(detection, is_new_detection):
+    """
+    Send webhook with same payload format as frontend popups
+    """
+    logging.info(f"Backend webhook called for {detection.get('mac')} - WEBHOOK_URL: {WEBHOOK_URL}")
+    
+    if not WEBHOOK_URL or not WEBHOOK_URL.startswith("http"):
+        logging.warning(f"Backend webhook skipped - invalid URL: {WEBHOOK_URL}")
+        return
+    
+    try:
+        mac = detection.get('mac')
+        alias = ALIASES.get(mac) if mac else None
+        
+        # Determine header message (same logic as frontend)
+        if not detection.get('drone_lat') or not detection.get('drone_long') or detection.get('drone_lat') == 0 or detection.get('drone_long') == 0:
+            header = 'Drone with no GPS lock detected'
+        elif alias:
+            header = f'Known drone detected – {alias}'
+        else:
+            header = 'New drone detected' if is_new_detection else 'Previously seen non-aliased drone detected'
+        
+        logging.info(f"Backend webhook for {mac}: {header}")
+        
+        # Build payload (same format as frontend)
+        payload = {
+            'alert': header,
+            'mac': mac,
+            'basic_id': detection.get('basic_id'),
+            'alias': alias,
+            'drone_lat': detection.get('drone_lat') if detection.get('drone_lat') != 0 else None,
+            'drone_long': detection.get('drone_long') if detection.get('drone_long') != 0 else None,
+            'pilot_lat': detection.get('pilot_lat') if detection.get('pilot_lat') != 0 else None,
+            'pilot_long': detection.get('pilot_long') if detection.get('pilot_long') != 0 else None,
+            'faa_data': None,  # Will be populated below
+            'drone_gmap': None,
+            'pilot_gmap': None,
+            'isNew': is_new_detection
+        }
+        
+        # Add FAA data if available
+        faa_data = detection.get('faa_data')
+        if faa_data and isinstance(faa_data, dict) and faa_data.get('data') and isinstance(faa_data['data'].get('items'), list) and len(faa_data['data']['items']) > 0:
+            payload['faa_data'] = faa_data['data']['items'][0]
+        
+        # Add Google Maps links
+        if payload['drone_lat'] and payload['drone_long']:
+            payload['drone_gmap'] = f"https://www.google.com/maps?q={payload['drone_lat']},{payload['drone_long']}"
+        if payload['pilot_lat'] and payload['pilot_long']:
+            payload['pilot_gmap'] = f"https://www.google.com/maps?q={payload['pilot_lat']},{payload['pilot_long']}"
+        
+        # Send webhook
+        logging.info(f"Sending webhook to {WEBHOOK_URL} with payload: {payload}")
+        response = requests.post(WEBHOOK_URL, json=payload, timeout=10)
+        logging.info(f"Backend webhook sent for {mac}: {response.status_code}")
+        
+    except requests.exceptions.Timeout:
+        logging.error(f"Backend webhook timeout for {detection.get('mac', 'unknown')}: URL {WEBHOOK_URL} timed out after 10 seconds")
+    except requests.exceptions.ConnectionError as e:
+        logging.error(f"Backend webhook connection error for {detection.get('mac', 'unknown')}: Unable to reach {WEBHOOK_URL} - {e}")
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Backend webhook request error for {detection.get('mac', 'unknown')}: {e}")
+    except Exception as e:
+        logging.error(f"Backend webhook error for {detection.get('mac', 'unknown')}: {e}")
+
+@app.route('/api/set_webhook_url', methods=['POST'])
+def api_set_webhook_url():
+    try:
+        # Check if request has JSON data
+        if not request.is_json:
+            return jsonify({"status": "error", "message": "Request must be JSON"}), 400
+        
+        data = request.get_json()
+        
+        # Handle case where data is None
+        if data is None:
+            return jsonify({"status": "error", "message": "Invalid JSON data"}), 400
+        
+        # Get webhook URL and handle None case
+        url = data.get('webhook_url', '')
+        if url is None:
+            url = ''
+        else:
+            url = str(url).strip()
+        
+        # Validate URL format if not empty
+        if url and not url.startswith(('http://', 'https://')):
+            return jsonify({"status": "error", "message": "Invalid webhook URL - must start with http:// or https://"}), 400
+        
+        # Additional URL validation for common issues
+        if url:
+            # Check for localhost variations that might not work
+            if 'localhost' in url and not url.startswith('http://localhost'):
+                return jsonify({"status": "error", "message": "For localhost URLs, please use http://localhost"}), 400
+        
+        # Set the webhook URL
+        set_server_webhook_url(url)
+        
+        # Log the update
+        if url:
+            logger.info(f"Webhook URL updated to: {url}")
+        else:
+            logger.info("Webhook URL cleared")
+        
+        return jsonify({"status": "ok", "webhook_url": WEBHOOK_URL})
+        
+    except Exception as e:
+        logger.error(f"Error setting webhook URL: {e}")
+        return jsonify({"status": "error", "message": f"Server error: {str(e)}"}), 500
+
+@app.route('/api/get_webhook_url', methods=['GET'])
+def api_get_webhook_url():
+    """Get the current webhook URL"""
+    try:
+        return jsonify({"status": "ok", "webhook_url": WEBHOOK_URL or ""})
+    except Exception as e:
+        logger.error(f"Error getting webhook URL: {e}")
+        return jsonify({"status": "error", "message": f"Server error: {str(e)}"}), 500
+
+@app.route('/api/webhook_url', methods=['GET'])
+def api_webhook_url():
+    return jsonify({"webhook_url": WEBHOOK_URL or ""})
+
+# --- Webhook URL Persistence ---
+WEBHOOK_URL_FILE = os.path.join(BASE_DIR, "webhook_url.json")
+
+def save_webhook_url():
+    """Save the current webhook URL to disk"""
+    global WEBHOOK_URL
+    try:
+        with open(WEBHOOK_URL_FILE, "w") as f:
+            json.dump({"webhook_url": WEBHOOK_URL}, f)
+        logger.debug(f"Webhook URL saved to {WEBHOOK_URL_FILE}")
+    except Exception as e:
+        logger.error(f"Error saving webhook URL: {e}")
+
+def load_webhook_url():
+    """Load the webhook URL from disk on startup"""
+    global WEBHOOK_URL
+    if os.path.exists(WEBHOOK_URL_FILE):
+        try:
+            with open(WEBHOOK_URL_FILE, "r") as f:
+                data = json.load(f)
+                WEBHOOK_URL = data.get("webhook_url", None)
+                if WEBHOOK_URL:
+                    logger.info(f"Loaded saved webhook URL: {WEBHOOK_URL}")
+                else:
+                    logger.info("No webhook URL found in saved file")
+        except Exception as e:
+            logger.error(f"Error loading webhook URL: {e}")
+            WEBHOOK_URL = None
+    else:
+        logger.info("No saved webhook URL file found")
+        WEBHOOK_URL = None
+
+def auto_connect_to_saved_ports():
+    """
+    Check if any previously saved ports are available and auto-connect to them.
+    Returns True if at least one port was connected, False otherwise.
+    """
+    global SELECTED_PORTS
+    
+    if not SELECTED_PORTS:
+        logger.info("No saved ports found for auto-connection")
+        return False
+    
+    # Get currently available ports
+    available_ports = {p.device for p in serial.tools.list_ports.comports()}
+    logger.debug(f"Available ports: {available_ports}")
+    
+    # Check which saved ports are still available
+    available_saved_ports = {}
+    for port_key, port_device in SELECTED_PORTS.items():
+        if port_device in available_ports:
+            available_saved_ports[port_key] = port_device
+    
+    if not available_saved_ports:
+        logger.warning("No previously used ports are currently available")
+        return False
+    
+    logger.info(f"Auto-connecting to previously used ports: {list(available_saved_ports.values())}")
+    
+    # Update SELECTED_PORTS to only include available ports
+    SELECTED_PORTS = available_saved_ports
+    
+    # Start serial threads for available ports
+    for port in SELECTED_PORTS.values():
+        serial_connected_status[port] = False
+        start_serial_thread(port)
+        logger.info(f"Started serial thread for port: {port}")
+    
+    # Send watchdog reset to each microcontroller over USB
+    time.sleep(2)  # Give threads time to establish connections
+    with serial_objs_lock:
+        for port, ser in serial_objs.items():
+            try:
+                if ser and ser.is_open:
+                    ser.write(b'WATCHDOG_RESET\n')
+                    logger.debug(f"Sent watchdog reset to {port}")
+            except Exception as e:
+                logger.error(f"Failed to send watchdog reset to {port}: {e}")
+    
+    return True
+
+# ----------------------
+# Webhook Functions (moved here to be available before update_detection)
+# ----------------------
+
+def should_trigger_webhook_earliest(detection, mac):
+    """
+    Determine if a webhook should be triggered based on the same logic as frontend popups.
+    Returns (should_trigger, is_new_detection)
+    """
+    global backend_seen_drones, backend_previous_active, backend_alerted_no_gps
+    
+    current_time = time.time()
+    
+    # Check if detection is within stale threshold (30 seconds)
+    if not detection.get('last_update') or (current_time - detection['last_update'] > 30):
+        return False, False
+    
+    # GPS drone logic
+    drone_lat = detection.get('drone_lat', 0)
+    drone_long = detection.get('drone_long', 0)
+    pilot_lat = detection.get('pilot_lat', 0) 
+    pilot_long = detection.get('pilot_long', 0)
+    
+    valid_drone = (drone_lat != 0 and drone_long != 0)
+    has_gps = valid_drone or (pilot_lat != 0 and pilot_long != 0)
+    has_recent_transmission = detection.get('last_update') and (current_time - detection['last_update'] <= 5)
+    is_no_gps_drone = not has_gps and has_recent_transmission
+    
+    # Calculate state
+    active_now = valid_drone and detection.get('last_update') and (current_time - detection['last_update'] <= 30)
+    was_active = backend_previous_active.get(mac, False)
+    is_new = mac not in backend_seen_drones
+    
+    should_trigger = False
+    popup_is_new = False
+    
+    # GPS drone webhook logic - trigger on transition from inactive to active
+    if not was_active and active_now:
+        should_trigger = True
+        alias = ALIASES.get(mac)
+        popup_is_new = not alias and is_new
+    
+    # No-GPS drone webhook logic - trigger once per detection session
+    elif is_no_gps_drone and mac not in backend_alerted_no_gps:
+        should_trigger = True
+        popup_is_new = True
+        backend_alerted_no_gps.add(mac)
+    
+    # Update tracking state
+    if should_trigger:
+        backend_seen_drones.add(mac)
+    backend_previous_active[mac] = active_now
+    
+    # Clean up no-GPS alerts when transmission stops
+    if not has_recent_transmission:
+        backend_alerted_no_gps.discard(mac)
+    
+    return should_trigger, popup_is_new
+
+def trigger_backend_webhook_earliest(detection, is_new_detection):
+    """
+    Send webhook with same payload format as frontend popups
+    """
+    logging.info(f"Backend webhook called for {detection.get('mac')} - WEBHOOK_URL: {WEBHOOK_URL}")
+    
+    if not WEBHOOK_URL or not WEBHOOK_URL.startswith("http"):
+        logging.warning(f"Backend webhook skipped - invalid URL: {WEBHOOK_URL}")
+        return
+    
+    try:
+        mac = detection.get('mac')
+        alias = ALIASES.get(mac) if mac else None
+        
+        # Determine header message (same logic as frontend)
+        if not detection.get('drone_lat') or not detection.get('drone_long') or detection.get('drone_lat') == 0 or detection.get('drone_long') == 0:
+            header = 'Drone with no GPS lock detected'
+        elif alias:
+            header = f'Known drone detected – {alias}'
+        else:
+            header = 'New drone detected' if is_new_detection else 'Previously seen non-aliased drone detected'
+        
+        logging.info(f"Backend webhook for {mac}: {header}")
+        
+        # Build payload (same format as frontend)
+        payload = {
+            'alert': header,
+            'mac': mac,
+            'basic_id': detection.get('basic_id'),
+            'alias': alias,
+            'drone_lat': detection.get('drone_lat') if detection.get('drone_lat') != 0 else None,
+            'drone_long': detection.get('drone_long') if detection.get('drone_long') != 0 else None,
+            'pilot_lat': detection.get('pilot_lat') if detection.get('pilot_lat') != 0 else None,
+            'pilot_long': detection.get('pilot_long') if detection.get('pilot_long') != 0 else None,
+            'faa_data': None,  # Will be populated below
+            'drone_gmap': None,
+            'pilot_gmap': None,
+            'isNew': is_new_detection
+        }
+        
+        # Add FAA data if available
+        faa_data = detection.get('faa_data')
+        if faa_data and isinstance(faa_data, dict) and faa_data.get('data') and isinstance(faa_data['data'].get('items'), list) and len(faa_data['data']['items']) > 0:
+            payload['faa_data'] = faa_data['data']['items'][0]
+        
+        # Add Google Maps links
+        if payload['drone_lat'] and payload['drone_long']:
+            payload['drone_gmap'] = f"https://www.google.com/maps?q={payload['drone_lat']},{payload['drone_long']}"
+        if payload['pilot_lat'] and payload['pilot_long']:
+            payload['pilot_gmap'] = f"https://www.google.com/maps?q={payload['pilot_lat']},{payload['pilot_long']}"
+        
+        # Send webhook
+        logging.info(f"Sending webhook to {WEBHOOK_URL} with payload: {payload}")
+        response = requests.post(WEBHOOK_URL, json=payload, timeout=10)
+        logging.info(f"Backend webhook sent for {mac}: {response.status_code}")
+        
+    except requests.exceptions.Timeout:
+        logging.error(f"Backend webhook timeout for {detection.get('mac', 'unknown')}: URL {WEBHOOK_URL} timed out after 10 seconds")
+    except requests.exceptions.ConnectionError as e:
+        logging.error(f"Backend webhook connection error for {detection.get('mac', 'unknown')}: Unable to reach {WEBHOOK_URL} - {e}")
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Backend webhook request error for {detection.get('mac', 'unknown')}: {e}")
+    except Exception as e:
+        logging.error(f"Backend webhook error for {detection.get('mac', 'unknown')}: {e}")
+
+
+if __name__ == '__main__':
+    main()
