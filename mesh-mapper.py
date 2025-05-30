@@ -11,9 +11,6 @@ import requests
 import urllib3
 import serial
 import serial.tools.list_ports
-import signal
-import sys
-import argparse
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
 from typing import Optional, List
@@ -22,53 +19,7 @@ from urllib3.util.retry import Retry
 from flask import Flask, request, jsonify, redirect, url_for, render_template, render_template_string, send_file
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ----------------------
-# Enhanced Logging Setup
-# ----------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('mapper.log'),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger(__name__)
-
-# ----------------------
-# Global Configuration
-# ----------------------
-HEADLESS_MODE = False
-AUTO_START_ENABLED = True
-PORT_MONITOR_INTERVAL = 10  # seconds
-SHUTDOWN_EVENT = threading.Event()
-
-# ----------------------
-# Signal Handlers for Graceful Shutdown
-# ----------------------
-def signal_handler(signum, frame):
-    """Handle shutdown signals gracefully"""
-    logger.info(f"Received signal {signum}, initiating graceful shutdown...")
-    SHUTDOWN_EVENT.set()
-    
-    # Close all serial connections
-    with serial_objs_lock:
-        for port, ser in serial_objs.items():
-            try:
-                if ser and ser.is_open:
-                    logger.info(f"Closing serial connection to {port}")
-                    ser.close()
-            except Exception as e:
-                logger.error(f"Error closing serial port {port}: {e}")
-    
-    logger.info("Shutdown complete")
-    sys.exit(0)
-
-# Register signal handlers
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
-
-# Helper: consistent color per MAC via hashing
+ # Helper: consistent color per MAC via hashing
 def get_color_for_mac(mac: str) -> str:
     # Compute hue from MAC string hash
     hue = sum(ord(c) for c in mac) % 360
@@ -110,9 +61,6 @@ serial_objs = {}
 serial_objs_lock = threading.Lock()
 
 startup_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-# Track when watchdog reset was sent to each port to ignore immediate responses
-last_watchdog_reset = {}
-WATCHDOG_IGNORE_DURATION = 3  # seconds to ignore detections after watchdog reset
 # Updated detections CSV header to include faa_data.
 CSV_FILENAME = os.path.join(BASE_DIR, f"detections_{startup_timestamp}.csv")
 KML_FILENAME = os.path.join(BASE_DIR, f"detections_{startup_timestamp}.kml")
@@ -158,7 +106,6 @@ if not os.path.exists(FAA_LOG_FILENAME):
 
 # --- Alias Persistence ---
 ALIASES_FILE = os.path.join(BASE_DIR, "aliases.json")
-PORTS_FILE = os.path.join(BASE_DIR, "selected_ports.json")
 ALIASES = {}
 if os.path.exists(ALIASES_FILE):
     try:
@@ -174,155 +121,6 @@ def save_aliases():
             json.dump(ALIASES, f)
     except Exception as e:
         print("Error saving aliases:", e)
-
-# --- Port Persistence ---
-def save_selected_ports():
-    global SELECTED_PORTS
-    try:
-        with open(PORTS_FILE, "w") as f:
-            json.dump(SELECTED_PORTS, f)
-    except Exception as e:
-        print("Error saving selected ports:", e)
-
-def load_selected_ports():
-    global SELECTED_PORTS
-    if os.path.exists(PORTS_FILE):
-        try:
-            with open(PORTS_FILE, "r") as f:
-                SELECTED_PORTS = json.load(f)
-        except Exception as e:
-            print("Error loading selected ports:", e)
-
-def auto_connect_to_saved_ports():
-    """
-    Check if any previously saved ports are available and auto-connect to them.
-    Returns True if at least one port was connected, False otherwise.
-    """
-    global SELECTED_PORTS
-    
-    if not SELECTED_PORTS:
-        logger.info("No saved ports found for auto-connection")
-        return False
-    
-    # Get currently available ports
-    available_ports = {p.device for p in serial.tools.list_ports.comports()}
-    logger.debug(f"Available ports: {available_ports}")
-    
-    # Check which saved ports are still available
-    available_saved_ports = {}
-    for port_key, port_device in SELECTED_PORTS.items():
-        if port_device in available_ports:
-            available_saved_ports[port_key] = port_device
-    
-    if not available_saved_ports:
-        logger.warning("No previously used ports are currently available")
-        return False
-    
-    logger.info(f"Auto-connecting to previously used ports: {list(available_saved_ports.values())}")
-    
-    # Update SELECTED_PORTS to only include available ports
-    SELECTED_PORTS = available_saved_ports
-    
-    # Start serial threads for available ports
-    for port in SELECTED_PORTS.values():
-        serial_connected_status[port] = False
-        start_serial_thread(port)
-        logger.info(f"Started serial thread for port: {port}")
-    
-    # Send watchdog reset to each microcontroller over USB
-    time.sleep(2)  # Give threads time to establish connections
-    with serial_objs_lock:
-        for port, ser in serial_objs.items():
-            try:
-                if ser and ser.is_open:
-                    ser.write(b'WATCHDOG_RESET\n')
-                    logger.debug(f"Sent watchdog reset to {port}")
-            except Exception as e:
-                logger.error(f"Failed to send watchdog reset to {port}: {e}")
-    
-    return True
-
-# ----------------------
-# Enhanced Port Monitoring
-# ----------------------
-def monitor_ports():
-    """
-    Continuously monitor for port availability changes and auto-connect when possible.
-    This runs in a separate thread for headless operation.
-    """
-    logger.info("Starting port monitoring thread...")
-    last_available_ports = set()
-    
-    while not SHUTDOWN_EVENT.is_set():
-        try:
-            # Get currently available ports
-            current_ports = {p.device for p in serial.tools.list_ports.comports()}
-            
-            # Check if port availability has changed
-            if current_ports != last_available_ports:
-                logger.info(f"Port availability changed. Current ports: {current_ports}")
-                
-                # If we have saved ports but no active connections, try to auto-connect
-                if SELECTED_PORTS and not any(serial_connected_status.values()):
-                    logger.info("Attempting auto-connection to saved ports...")
-                    if auto_connect_to_saved_ports():
-                        logger.info("Auto-connection successful! Mapping is now active.")
-                    else:
-                        logger.info("Auto-connection failed. Waiting for ports...")
-                
-                # Check for disconnected ports
-                for port in list(serial_connected_status.keys()):
-                    if port not in current_ports and serial_connected_status.get(port, False):
-                        logger.warning(f"Port {port} disconnected")
-                        serial_connected_status[port] = False
-                        with serial_objs_lock:
-                            if port in serial_objs:
-                                try:
-                                    serial_objs[port].close()
-                                except:
-                                    pass
-                                del serial_objs[port]
-                
-                last_available_ports = current_ports.copy()
-            
-            # Wait before next check
-            SHUTDOWN_EVENT.wait(PORT_MONITOR_INTERVAL)
-            
-        except Exception as e:
-            logger.error(f"Error in port monitoring: {e}")
-            SHUTDOWN_EVENT.wait(5)  # Wait 5 seconds before retrying
-
-def start_port_monitoring():
-    """Start the port monitoring thread"""
-    if AUTO_START_ENABLED:
-        monitor_thread = threading.Thread(target=monitor_ports, daemon=True)
-        monitor_thread.start()
-        logger.info("Port monitoring thread started")
-
-# ----------------------
-# Enhanced Status Reporting
-# ----------------------
-def log_system_status():
-    """Log current system status for headless monitoring"""
-    logger.info("=== SYSTEM STATUS ===")
-    logger.info(f"Selected ports: {SELECTED_PORTS}")
-    logger.info(f"Serial connection status: {serial_connected_status}")
-    logger.info(f"Active detections: {len(detection_history)}")
-    logger.info(f"Tracked MACs: {len(set(d.get('mac') for d in detection_history if d.get('mac')))}")
-    logger.info(f"Headless mode: {HEADLESS_MODE}")
-    logger.info("====================")
-
-def start_status_logging():
-    """Start periodic status logging for headless operation"""
-    def status_logger():
-        while not SHUTDOWN_EVENT.is_set():
-            log_system_status()
-            SHUTDOWN_EVENT.wait(300)  # Log status every 5 minutes
-    
-    if HEADLESS_MODE:
-        status_thread = threading.Thread(target=status_logger, daemon=True)
-        status_thread.start()
-        logger.info("Status logging thread started")
 
 # ----------------------
 # FAA Cache Persistence
@@ -366,10 +164,18 @@ def generate_kml():
     # Build sorted list of all MACs seen so far
     macs = sorted({d['mac'] for d in detection_history})
 
-    # Use consistent color generation function
+    # Dynamically generate one distinct ABGR color per MAC
     mac_colors = {}
-    for mac in macs:
-        mac_colors[mac] = get_color_for_mac(mac)
+    n = len(macs) or 1
+    for i, m in enumerate(macs):
+        # evenly‐spaced hue 0.0–1.0
+        h = i / n
+        # full saturation & value → RGB floats 0–1
+        r, g, b = colorsys.hsv_to_rgb(h, 1.0, 1.0)
+        # scale to 0–255 ints
+        ri, gi, bi = int(r*255), int(g*255), int(b*255)
+        # format for KML (ABGR hex, alpha=ff)
+        mac_colors[m] = f"ff{bi:02x}{gi:02x}{ri:02x}"
 
     # Start KML document template
     kml_lines = [
@@ -407,10 +213,7 @@ def generate_kml():
                         # drone path
                         coords = " ".join(f"{x[0]},{x[1]},0" for x in current_flight)
                         kml_lines.append(f'<Placemark><Style><LineStyle><color>{color}</color><width>2</width></LineStyle></Style><LineString><tessellate>1</tessellate><coordinates>{coords}</coordinates></LineString></Placemark>')
-                        # drone start icon
-                        start_lon, start_lat, start_ts = current_flight[0]
-                        kml_lines.append(f'<Placemark><name>Drone Start {flight_idx} {aliasStr}{mac}</name><Style><IconStyle><color>{color}</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/airports.png</href></Icon></IconStyle></Style><Point><coordinates>{start_lon},{start_lat},0</coordinates></Point></Placemark>')
-                        # drone end icon
+                        # end icons
                         end_lon, end_lat, end_ts = current_flight[-1]
                         kml_lines.append(f'<Placemark><name>Drone End {flight_idx} {aliasStr}{mac}</name><Style><IconStyle><color>{color}</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/heliport.png</href></Icon></IconStyle></Style><Point><coordinates>{end_lon},{end_lat},0</coordinates></Point></Placemark>')
                         # pilot path inside same flight
@@ -436,9 +239,6 @@ def generate_kml():
             kml_lines.append(f'<name>Flight {flight_idx} {aliasStr}{mac} ({start_str})</name>')
             coords = " ".join(f"{x[0]},{x[1]},0" for x in current_flight)
             kml_lines.append(f'<Placemark><Style><LineStyle><color>{color}</color><width>2</width></LineStyle></Style><LineString><tessellate>1</tessellate><coordinates>{coords}</coordinates></LineString></Placemark>')
-            # drone start icon
-            start_lon, start_lat, start_ts = current_flight[0]
-            kml_lines.append(f'<Placemark><name>Drone Start {flight_idx} {aliasStr}{mac}</name><Style><IconStyle><color>{color}</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/airports.png</href></Icon></IconStyle></Style><Point><coordinates>{start_lon},{start_lat},0</coordinates></Point></Placemark>')
             end_lon, end_lat, end_ts = current_flight[-1]
             kml_lines.append(f'<Placemark><name>Drone End {flight_idx} {aliasStr}{mac}</name><Style><IconStyle><color>{color}</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/heliport.png</href></Icon></IconStyle></Style><Point><coordinates>{end_lon},{end_lat},0</coordinates></Point></Placemark>')
             pilot_pts = [(d['pilot_long'], d['pilot_lat']) for d in detection_history if d.get('mac')==mac and d.get('pilot_lat') and d.get('pilot_long') and d.get('last_update')>=current_flight[0][2] and d.get('last_update')<=end_ts]
@@ -462,35 +262,30 @@ def generate_cumulative_kml():
     """
     Build cumulative KML by reading the cumulative CSV and grouping detections into flights.
     """
-    # Check if cumulative CSV exists
-    if not os.path.exists(CUMULATIVE_CSV_FILENAME):
-        print(f"Warning: Cumulative CSV file {CUMULATIVE_CSV_FILENAME} does not exist yet.")
-        return
-    
     # Read cumulative CSV history
     history = []
-    try:
-        with open(CUMULATIVE_CSV_FILENAME, newline='') as csvfile:
-            reader = csv.DictReader(csvfile)
-            for row in reader:
-                # Parse timestamp
-                ts = datetime.fromisoformat(row['timestamp'])
-                row['last_update'] = ts
-                # Convert coordinates
-                row['drone_lat'] = float(row['drone_lat']) if row['drone_lat'] else 0.0
-                row['drone_long'] = float(row['drone_long']) if row['drone_long'] else 0.0
-                row['pilot_lat'] = float(row['pilot_lat']) if row['pilot_lat'] else 0.0
-                row['pilot_long'] = float(row['pilot_long']) if row['pilot_long'] else 0.0
-                history.append(row)
-    except Exception as e:
-        print(f"Error reading cumulative CSV: {e}")
-        return
+    with open(CUMULATIVE_CSV_FILENAME, newline='') as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            # Parse timestamp
+            ts = datetime.fromisoformat(row['timestamp'])
+            row['last_update'] = ts
+            # Convert coordinates
+            row['drone_lat'] = float(row['drone_lat']) if row['drone_lat'] else 0.0
+            row['drone_long'] = float(row['drone_long']) if row['drone_long'] else 0.0
+            row['pilot_lat'] = float(row['pilot_lat']) if row['pilot_lat'] else 0.0
+            row['pilot_long'] = float(row['pilot_long']) if row['pilot_long'] else 0.0
+            history.append(row)
 
-    # Determine unique MACs and assign consistent colors
+    # Determine unique MACs and assign colors
     macs = sorted({d['mac'] for d in history})
     mac_colors = {}
-    for mac in macs:
-        mac_colors[mac] = get_color_for_mac(mac)
+    n = len(macs) or 1
+    for i, m in enumerate(macs):
+        h = i / n
+        r, g, b = colorsys.hsv_to_rgb(h, 1.0, 1.0)
+        ri, gi, bi = int(r*255), int(g*255), int(b*255)
+        mac_colors[m] = f"ff{bi:02x}{gi:02x}{ri:02x}"
 
     # Start KML
     kml_lines = [
@@ -529,9 +324,6 @@ def generate_cumulative_kml():
                         # drone path
                         coords = " ".join(f"{lo},{la},0" for lo, la, _ in current_flight)
                         kml_lines.append(f'<Placemark><Style><LineStyle><color>{color}</color><width>2</width></LineStyle></Style><LineString><tessellate>1</tessellate><coordinates>{coords}</coordinates></LineString></Placemark>')
-                        # drone start icon
-                        start_lo, start_la, start_ts = current_flight[0]
-                        kml_lines.append(f'<Placemark><name>Drone Start {flight_idx} {aliasStr}{mac}</name><Style><IconStyle><color>{color}</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/airports.png</href></Icon></IconStyle></Style><Point><coordinates>{start_lo},{start_la},0</coordinates></Point></Placemark>')
                         # drone end icon
                         end_lo, end_la, end_ts = current_flight[-1]
                         kml_lines.append(f'<Placemark><name>Drone End {flight_idx} {aliasStr}{mac}</name><Style><IconStyle><color>{color}</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/heliport.png</href></Icon></IconStyle></Style><Point><coordinates>{end_lo},{end_la},0</coordinates></Point></Placemark>')
@@ -560,9 +352,6 @@ def generate_cumulative_kml():
             kml_lines.append(f'<name>Flight {flight_idx} {aliasStr}{mac} ({start_str})</name>')
             coords = " ".join(f"{lo},{la},0" for lo, la, _ in current_flight)
             kml_lines.append(f'<Placemark><Style><LineStyle><color>{color}</color><width>2</width></LineStyle></Style><LineString><tessellate>1</tessellate><coordinates>{coords}</coordinates></LineString></Placemark>')
-            # drone start icon
-            start_lo, start_la, start_ts = current_flight[0]
-            kml_lines.append(f'<Placemark><name>Drone Start {flight_idx} {aliasStr}{mac}</name><Style><IconStyle><color>{color}</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/airports.png</href></Icon></IconStyle></Style><Point><coordinates>{start_lo},{start_la},0</coordinates></Point></Placemark>')
             end_lo, end_la, end_ts = current_flight[-1]
             kml_lines.append(f'<Placemark><name>Drone End {flight_idx} {aliasStr}{mac}</name><Style><IconStyle><color>{color}</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/heliport.png</href></Icon></IconStyle></Style><Point><coordinates>{end_lo},{end_la},0</coordinates></Point></Placemark>')
             start_ts = current_flight[0][2]
@@ -574,13 +363,10 @@ def generate_cumulative_kml():
                 kml_lines.append(f'<Placemark><name>Pilot End {flight_idx} {aliasStr}{mac}</name><Style><IconStyle><color>{color}</color><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/man.png</href></Icon></IconStyle></Style><Point><coordinates>{plon},{plat},0</coordinates></Point></Placemark>')
             kml_lines.append('</Folder>')
 
-    # Close document
+    # Close KML and write
     kml_lines.append('</Document></kml>')
-
-    # Write cumulative KML
     with open(CUMULATIVE_KML_FILENAME, "w") as f:
         f.write("\n".join(kml_lines))
-    print("Updated cumulative KML:", CUMULATIVE_KML_FILENAME)
 
 
 # Generate initial KML so the file exists from startup
@@ -1080,23 +866,6 @@ PORT_SELECTION_PAGE = '''
         })
         .catch(err => console.error('Error refreshing ports:', err));
     }
-
-    function loadSelectedPorts() {
-      fetch('/api/selected_ports')
-        .then(res => res.json())
-        .then(data => {
-          const selectedPorts = data.selected_ports || {};
-          // Populate dropdowns with currently selected ports
-          ['port1', 'port2', 'port3'].forEach(name => {
-            const select = document.getElementById(name);
-            if (select && selectedPorts[name]) {
-              select.value = selectedPorts[name];
-            }
-          });
-        })
-        .catch(err => console.error('Error loading selected ports:', err));
-    }
-
     var refreshInterval = setInterval(refreshPortOptions, 2000);
     ['port1','port2','port3'].forEach(function(name) {
       var select = document.getElementById(name);
@@ -1109,8 +878,6 @@ PORT_SELECTION_PAGE = '''
     });
     window.onload = function() {
       refreshPortOptions();
-      // Load currently selected ports after refreshing port options
-      setTimeout(loadSelectedPorts, 100);
     }
     const webhookInput = document.getElementById('webhookUrl');
     const storedWebhookUrl = localStorage.getItem('popupWebhookUrl') || '';
@@ -1205,9 +972,8 @@ HTML_PAGE = '''
       background-color: #333;
       color: lime;
       border: none;
-      padding: 3px;  /* reduced from 6px but still larger than original 2.1px */
-      font-size: 1em;  /* keep larger font */
-      min-width: 160px;  /* keep wide enough */
+      padding: 2.1px;
+      font-size: 0.7em;
     }
     
         #filterBox {
@@ -1743,14 +1509,13 @@ HTML_PAGE = '''
     </div>
     <!-- Node Mode block -->
     <div style="margin-top:8px; display:flex; flex-direction:column; align-items:center;">
-      <label style="color:lime; font-family:monospace; margin-bottom:4px;">Polling Speed</label>
-      <div style="display:flex; align-items:center; gap:8px;">
-        <span style="color:#FF00FF; font-family:monospace; font-size:0.8em;">100ms</span>
-        <label class="switch">
-          <input type="checkbox" id="nodeModeMainSwitch">
-          <span class="slider"></span>
-        </label>
-        <span style="color:#FF00FF; font-family:monospace; font-size:0.8em;">1s</span>
+      <label style="color:lime; font-family:monospace; margin-bottom:4px;">Node Mode</label>
+      <label class="switch">
+        <input type="checkbox" id="nodeModeMainSwitch">
+        <span class="slider"></span>
+      </label>
+      <div style="color:#FF00FF; font-family:monospace; font-size:0.75em; text-align:center; margin-top:4px;">
+        Polls detections every second instead of every 100 ms to reduce CPU/battery use in Node Mode
       </div>
     </div>
     <button id="settingsButton"
@@ -1768,6 +1533,9 @@ HTML_PAGE = '''
             onclick="window.location.href='/select_ports'">
       Settings
     </button>
+    <div style="color:#FF00FF; font-family:monospace; font-size:0.75em; text-align:center; margin-top:4px;">
+      Return to port selection and settings screen
+    </div>
   </div>
 </div>
 <div id="serialStatus">
@@ -1777,6 +1545,15 @@ HTML_PAGE = '''
   // Do not clear trackedPairs; persist across reloads
   // Track drones already alerted for no GPS
   const alertedNoGpsDrones = new Set();
+  // Suppress alerts for any non-GPS drones already in localStorage
+  try {
+    const stored = JSON.parse(localStorage.getItem("trackedPairs") || "{}");
+    Object.entries(stored)
+      .filter(([mac, det]) => !det.drone_lat || !det.drone_long)
+      .forEach(([mac]) => alertedNoGpsDrones.add(mac));
+  } catch (e) {
+    console.error("Failed to initialize alertedNoGpsDrones:", e);
+  }
   // Round tile positions to integer pixels to eliminate seams
   L.DomUtil.setPosition = (function() {
     var original = L.DomUtil.setPosition;
@@ -1964,7 +1741,7 @@ function safeSetView(latlng, zoom=18) {
   const currentZoom = map.getZoom();
   // make sure we have a Leaflet LatLng
   const target = L.latLng(latlng);
-  // if it's already on-screen, do just a small "quarter" zoom
+  // if it's already on-screen, do just a small “quarter” zoom
   if (map.getBounds().contains(target)) {
     const smallZoom = currentZoom + (zoom - currentZoom) * 0.25;
     map.flyTo(target, smallZoom, { duration: 0.4 });
@@ -2024,6 +1801,8 @@ function showTerminalPopup(det, isNew) {
     : `${header} - RID:${rid} MAC:${det.mac}`;
   // Build popup HTML and button using new logic
   // Build popup text
+  // (BEGIN PATCHED BUTTON & POPUP LOGIC)
+  // Build popup text
   const isMobileBtn = window.innerWidth <= 600;
   const headerDiv = `<div>${content}</div>`;
   let buttonDiv = '';
@@ -2052,6 +1831,8 @@ function showTerminalPopup(det, isNew) {
       safeSetView([det.drone_lat, det.drone_long]);
     });
   }
+  // (END PATCHED BUTTON & POPUP LOGIC)
+
   // --- Webhook logic (scoped, non-intrusive) ---
   try {
     const webhookUrl = localStorage.getItem('popupWebhookUrl');
@@ -2759,12 +2540,9 @@ function updateComboList(data) {
     const color = get_color_for_mac(mac);
     item.style.borderColor = color;
     item.style.color = color;
-    
-    // Only mark items as recent if they are active AND within the last 3 seconds
-    // This prevents flashing on stale drones
-    const isRecent = detection && isActive && ((currentTime - detection.last_update) <= 3);
+    // Mark items seen in the last 5 second
+    const isRecent = detection && ((currentTime - detection.last_update) <= 5);
     item.classList.toggle('recent', isRecent);
-    
     if (isActive) {
       if (item.parentNode !== activePlaceholder) { activePlaceholder.appendChild(item); }
     } else {
@@ -2947,7 +2725,7 @@ async function updateData() {
         if (followLock.enabled && followLock.type === 'pilot' && followLock.id === mac) { map.setView([pilotLat, pilotLng], map.getZoom()); }
       }
       // At end of loop iteration, remember this state for next time
-      // previousActive[mac] = validDrone;
+      previousActive[mac] = validDrone;
     }
     initialLoad = false;
     updateComboList(data);
@@ -3175,9 +2953,6 @@ def select_ports_post():
         if port:
             SELECTED_PORTS[f'port{i}'] = port
 
-    # Save selected ports for auto-connection on restart
-    save_selected_ports()
-
     # Start serial-reader threads for selected ports
     for port in SELECTED_PORTS.values():
         serial_connected_status[port] = False
@@ -3201,20 +2976,20 @@ def select_ports_post():
 BOTTOM_ASCII = r"""
 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣀⣄⣠⣀⡀⣀⣠⣤⣤⣤⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣄⢠⣠⣼⣿⣿⣿⣟⣿⣿⣿⣿⣿⣿⣿⡿⠋⠀⠀⠀⢠⣤⣦⡄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠰⢦⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⣼⣿⣟⣾⣿⣽⣿⣿⣅⠈⠉⠻⣿⣿⣿⣿⣿⡿⠇⠀⠀⠀⠀⠉⠀⠀⠀⠀⠀⢀⡶⠒⢉⡀⢠⣤⣶⣶⣿⣷⣆⣀⡀⠀⢲⣖⠒⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⣼⣿⣟⣾⣿⣽⣿⣿⣅⠈⠉⠻⣿⣿⣿⣿⣿⡿⠇⠀⠀⠀⠀⠀⠉⠀⠀⠀⠀⠀⢀⡶⠒⢉⡀⢠⣤⣶⣶⣿⣷⣆⣀⡀⠀⢲⣖⠒⠀⠀⠀⠀⠀⠀⠀
 ⢀⣤⣾⣶⣦⣤⣤⣶⣿⣿⣿⣿⣿⣿⣽⡿⠻⣷⣀⠀⢻⣿⣿⣿⡿⠟⠀⠀⠀⠀⠀⠀⣤⣶⣶⣤⣀⣀⣬⣷⣦⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣶⣦⣤⣦⣼⣀⠀
-⠈⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠛⠓⣿⣿⠟⠁⠘⣿⡟⠁⠀⠘⠛⠁⠀⠀⢠⣾⣿⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠏⠙⠁
-⠀⠀⠸⠟⠋⠀⠀⠙⣿⣿⣿⣿⣿⣿⣷⣦⡄⣿⣿⣿⣆⠀⠀⠀⠀⠀⠀⠀⠀⣼⣆⢘⣿⣯⣼⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡉⠉⢱⡿⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠘⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣟⡿⠦⠀⠀⠀⠀⠀⠀⠀⠙⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⡗⠀⠈⠀⠀⠀⠀⠀
+⠈⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠛⠓⣿⣿⠟⠁⠘⣿⡟⠁⠀⠘⠛⠁⠀⠀⢠⣾⣿⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠏⠙⠁
+⠀⠀⠸⠟⠋⠀⠈⠙⣿⣿⣿⣿⣿⣿⣷⣦⡄⣿⣿⣿⣆⠀⠀⠀⠀⠀⠀⠀⠀⣼⣆⢘⣿⣯⣼⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡉⠉⢱⡿⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠘⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣟⡿⠦⠀⠀⠀⠀⠀⠀⠀⠙⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⡗⠀⠈⠀⠀⠀⠀⠀⠀
 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢻⣿⣿⣿⣿⣿⣿⣿⣿⠋⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⢿⣿⣉⣿⡿⢿⢷⣾⣾⣿⣞⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠋⣠⠟⠀⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠹⣿⣿⣿⠿⠿⣿⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⣾⣿⣿⣷⣦⣶⣦⣼⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⠈⠛⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠻⣿⣤⡖⠛⠶⠤⡀⠀⠀⠀⠀⠀⠀⠀⢰⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠁⠙⣿⣿⠿⢻⣿⣿⡿⠋⢩⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠹⣿⣿⣿⠿⠿⣿⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⣾⣿⣿⣷⣦⣶⣦⣼⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⠈⠛⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠻⣿⣤⡖⠛⠶⠤⡀⠀⠀⠀⠀⠀⠀⠀⢰⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠁⠙⣿⣿⠿⢻⣿⣿⡿⠋⢩⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠙⠧⣤⣦⣤⣄⡀⠀⠀⠀⠀⠀⠘⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⠀⠀⠀⠘⣧⠀⠈⣹⡻⠇⢀⣿⡆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⣿⣿⣿⣿⣿⣤⣀⡀⠀⠀⠀⠀⠀⠀⠀⠀⠈⢽⣿⣿⣿⣿⠋⠀⠀⠀⠀⠀⠀⠀⠀⠀⠹⣷⣴⣿⣷⢲⣦⣤⡀⢀⡀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⢿⣿⣿⣿⣿⣿⣿⠟⠀⠀⠀⠀⠀⠀⠀⢸⣿⣿⣿⣿⣷⢀⡄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠉⠂⠛⣆⣤⡜⣟⠋⠙⠂⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢹⣿⣿⣿⣿⠟⠀⠀⠀⠀⠀⠀⠀⠀⠘⣿⣿⣿⣿⠉⣿⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣤⣾⣿⣿⣿⣿⣿⣆⠀⠰⠄⠀⠉⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⣿⣿⣿⣿⣿⣤⣀⡀⠀⠀⠀⠀⠀⠀⠀⠀⠈⢽⣿⣿⣿⣿⠋⠀⠀⠀⠀⠀⠀⠀⠀⠹⣷⣴⣿⣷⢲⣦⣤⡀⢀⡀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⢿⣿⣿⣿⣿⣿⣿⠟⠀⠀⠀⠀⠀⠀⠀⢸⣿⣿⣿⣿⣷⢀⡄⠀⠀⠀⠀⠀⠀⠀⠀⠈⠉⠂⠛⣆⣤⡜⣟⠋⠙⠂⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢹⣿⣿⣿⣿⠟⠀⠀⠀⠀⠀⠀⠀⠀⠘⣿⣿⣿⣿⠉⣿⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣤⣾⣿⣿⣿⣿⣆⠀⠰⠄⠀⠉⠀⠀
 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣸⣿⣿⡿⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢹⣿⡿⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢻⣿⠿⠿⣿⣿⣿⠇⠀⠀⢀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣿⡿⠛⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠙⠁⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣿⡿⠛⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⢻⡇⠀⠀⢀⣼⠗⠀⠀
 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⣿⠃⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠙⠁⠀⠀⠀
 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠙⠒⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 """
@@ -3236,20 +3011,8 @@ ________                                  _____
 
 @app.route('/')
 def index():
-    # Load previously saved ports and attempt auto-connection
-    load_selected_ports()
-    
-    # If no ports are currently selected, try to auto-connect to saved ports
-    if len(SELECTED_PORTS) == 0:
+    if (len(SELECTED_PORTS) == 0):
         return redirect(url_for('select_ports_get'))
-    
-    # If we have saved ports but they're not connected, try auto-connecting
-    if not any(serial_connected_status.get(port, False) for port in SELECTED_PORTS.values()):
-        auto_connected = auto_connect_to_saved_ports()
-        if not auto_connected:
-            # If auto-connection failed, redirect to port selection
-            return redirect(url_for('select_ports_get'))
-    
     return HTML_PAGE
 
 @app.route('/api/detections', methods=['GET'])
@@ -3331,11 +3094,6 @@ def api_ports():
 def api_serial_status():
     return jsonify({"statuses": serial_connected_status})
 
-# New endpoint to get currently selected ports
-@app.route('/api/selected_ports', methods=['GET'])
-def api_selected_ports():
-    return jsonify({"selected_ports": SELECTED_PORTS})
-
 @app.route('/api/paths', methods=['GET'])
 def api_paths():
     drone_paths = {}
@@ -3369,31 +3127,19 @@ def api_paths():
 # ----------------------
 def serial_reader(port):
     ser = None
-    connection_attempts = 0
-    max_connection_attempts = 5
-    
-    while not SHUTDOWN_EVENT.is_set():
+    while True:
         # Try to open or re-open the serial port
         if ser is None or not getattr(ser, 'is_open', False):
             try:
                 ser = serial.Serial(port, BAUD_RATE, timeout=1)
                 serial_connected_status[port] = True
-                connection_attempts = 0  # Reset counter on successful connection
-                logger.info(f"Opened serial port {port} at {BAUD_RATE} baud.")
+                print(f"Opened serial port {port} at {BAUD_RATE} baud.")
                 with serial_objs_lock:
                     serial_objs[port] = ser
             except Exception as e:
                 serial_connected_status[port] = False
-                connection_attempts += 1
-                logger.error(f"Error opening serial port {port} (attempt {connection_attempts}): {e}")
-                
-                # If we've failed too many times, wait longer before retrying
-                if connection_attempts >= max_connection_attempts:
-                    logger.warning(f"Max connection attempts reached for {port}, waiting 30 seconds...")
-                    time.sleep(30)
-                    connection_attempts = 0  # Reset counter
-                else:
-                    time.sleep(1)
+                print(f"Error opening serial port {port}: {e}")
+                time.sleep(1)
                 continue
 
         try:
@@ -3402,51 +3148,30 @@ def serial_reader(port):
                 line = ser.readline().decode('utf-8', errors='ignore').strip()
                 if not line:
                     continue
-                    
                 # JSON extraction and detection handling...
                 if '{' in line:
                     json_str = line[line.find('{'):]
                 else:
                     json_str = line
-                    
                 try:
                     detection = json.loads(json_str)
-                    # Skip heartbeat messages
-                    if 'heartbeat' in detection:
-                        continue
-                    
-                    # Skip watchdog reset responses and status messages
-                    if any(key in detection for key in ['watchdog', 'status', 'reset', 'initialized']):
-                        logger.debug(f"Skipping watchdog/status message from {port}: {detection}")
-                        continue
-                    
                     # MAC tracking logic...
                     if 'mac' in detection:
                         last_mac_by_port[port] = detection['mac']
                     elif port in last_mac_by_port:
                         detection['mac'] = last_mac_by_port[port]
-                    
-                    # Normalize remote_id field
-                    if 'remote_id' in detection and 'basic_id' not in detection:
-                        detection['basic_id'] = detection['remote_id']
-                    
-                    # Process the detection
-                    update_detection(detection)
-                    
-                    # Log detection in headless mode
-                    if HEADLESS_MODE and detection.get('mac'):
-                        logger.debug(f"Detection from {port}: MAC {detection['mac']}, "
-                                   f"RSSI {detection.get('rssi', 'N/A')}")
-                        
-                except json.JSONDecodeError as e:
-                    logger.debug(f"JSON decode error on {port}: {e} - Line: {line[:100]}")
+                except json.JSONDecodeError:
                     continue
+                if 'remote_id' in detection and 'basic_id' not in detection:
+                    detection['basic_id'] = detection['remote_id']
+                if 'heartbeat' in detection:
+                    continue
+                update_detection(detection)
             else:
                 time.sleep(0.1)
-                
         except (serial.SerialException, OSError) as e:
             serial_connected_status[port] = False
-            logger.error(f"SerialException/OSError on {port}: {e}")
+            print(f"SerialException/OSError on {port}: {e}")
             try:
                 if ser and ser.is_open:
                     ser.close()
@@ -3456,10 +3181,9 @@ def serial_reader(port):
             with serial_objs_lock:
                 serial_objs.pop(port, None)
             time.sleep(1)
-            
         except Exception as e:
             serial_connected_status[port] = False
-            logger.error(f"Unexpected error on {port}: {e}")
+            print(f"Unexpected error on {port}: {e}")
             try:
                 if ser and ser.is_open:
                     ser.close()
@@ -3504,8 +3228,6 @@ def download_cumulative_csv():
 
 @app.route('/download/cumulative.kml')
 def download_cumulative_kml():
-    # regenerate cumulative KML to include latest detections
-    generate_cumulative_kml()
     return send_file(
         CUMULATIVE_KML_FILENAME,
         mimetype='application/vnd.google-earth.kml+xml',
@@ -3513,133 +3235,82 @@ def download_cumulative_kml():
         download_name='cumulative.kml'
     )
 
-# ----------------------
-# Startup Auto-Connection
-# ----------------------
-def startup_auto_connect():
-    """
-    Load saved ports and attempt auto-connection on startup.
-    Enhanced version with better logging and headless support.
-    """
-    logger.info("=== DRONE MAPPER STARTUP ===")
-    logger.info("Loading previously saved ports...")
-    load_selected_ports()
-    
-    if SELECTED_PORTS:
-        logger.info(f"Found saved ports: {list(SELECTED_PORTS.values())}")
-        auto_connected = auto_connect_to_saved_ports()
-        if auto_connected:
-            logger.info("Auto-connection successful! Mapping is now active.")
-            if HEADLESS_MODE:
-                logger.info("Running in headless mode - mapping will continue automatically")
-        else:
-            logger.warning("Auto-connection failed. Port selection will be required.")
-            if HEADLESS_MODE:
-                logger.info("Headless mode: Will monitor for port availability...")
-    else:
-        logger.info("No previously saved ports found.")
-        if HEADLESS_MODE:
-            logger.info("Headless mode: Will monitor for any available ports...")
-    
-    # Start monitoring and status logging
-    start_port_monitoring()
-    start_status_logging()
-    
-    logger.info("=== STARTUP COMPLETE ===")
-
-def parse_arguments():
-    """Parse command line arguments"""
-    parser = argparse.ArgumentParser(
-        description='Drone Detection Mapper - Automatically detect and map drone activity',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python mapper.py                    # Start with web interface
-  python mapper.py --headless         # Run in headless mode (no web interface)
-  python mapper.py --no-auto-start    # Disable automatic port connection
-  python mapper.py --port-interval 5  # Check for ports every 5 seconds
-  python mapper.py --debug            # Enable debug logging
-        """
-    )
-    
-    parser.add_argument(
-        '--headless',
-        action='store_true',
-        help='Run in headless mode without web interface'
-    )
-    
-    parser.add_argument(
-        '--no-auto-start',
-        action='store_true',
-        help='Disable automatic port connection and monitoring'
-    )
-    
-    parser.add_argument(
-        '--port-interval',
-        type=int,
-        default=10,
-        help='Port monitoring interval in seconds (default: 10)'
-    )
-    
-    parser.add_argument(
-        '--web-port',
-        type=int,
-        default=5000,
-        help='Web interface port (default: 5000)'
-    )
-    
-    parser.add_argument(
-        '--debug',
-        action='store_true',
-        help='Enable debug logging'
-    )
-    
-    return parser.parse_args()
-
-def main():
-    """Main function with enhanced startup and configuration"""
-    global HEADLESS_MODE, AUTO_START_ENABLED, PORT_MONITOR_INTERVAL
-    
-    # Parse command line arguments
-    args = parse_arguments()
-    
-    # Configure global settings
-    HEADLESS_MODE = args.headless
-    AUTO_START_ENABLED = not args.no_auto_start
-    PORT_MONITOR_INTERVAL = args.port_interval
-    
-    # Configure logging level
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-        logger.info("Debug logging enabled")
-    
-    logger.info(f"Starting Drone Mapper...")
-    logger.info(f"Headless mode: {HEADLESS_MODE}")
-    logger.info(f"Auto-start enabled: {AUTO_START_ENABLED}")
-    logger.info(f"Port monitoring interval: {PORT_MONITOR_INTERVAL}s")
-    
-    # Perform startup auto-connection
-    startup_auto_connect()
-    
-    if HEADLESS_MODE:
-        logger.info("Running in headless mode - press Ctrl+C to stop")
-        try:
-            # In headless mode, just wait for shutdown signal
-            while not SHUTDOWN_EVENT.is_set():
-                SHUTDOWN_EVENT.wait(60)  # Check every minute
-        except KeyboardInterrupt:
-            logger.info("Received keyboard interrupt")
-        finally:
-            signal_handler(signal.SIGTERM, None)
-    else:
-        logger.info(f"Starting web interface on port {args.web_port}")
-        logger.info(f"Access the interface at: http://localhost:{args.web_port}")
-        try:
-            app.run(host='0.0.0.0', port=args.web_port, debug=False)
-        except KeyboardInterrupt:
-            logger.info("Received keyboard interrupt")
-        finally:
-            signal_handler(signal.SIGTERM, None)
-
 if __name__ == '__main__':
-    main()
+    app.run(host='0.0.0.0', port=5000)
+
+
+app = Flask(__name__)
+
+# --- FAA Data Cache (simple in-memory for example) ---
+FAA_CACHE = {}  # key: (mac, remote_id) or (mac, ""), value: faa_data dict
+TRACKED_PAIRS = {}  # key: mac, value: dict with at least 'basic_id' and 'faa_data'
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FAA_LOG_FILENAME = os.path.join(BASE_DIR, "faa_log.csv")
+
+# --- FAA Query API Endpoint ---
+@app.route('/api/query_faa', methods=['POST'])
+def api_query_faa():
+    data = request.get_json()
+    mac = data.get("mac")
+    remote_id = data.get("remote_id")
+    if not mac or not remote_id:
+        return jsonify({"status": "error", "message": "Missing mac or remote_id"}), 400
+    # Simulate FAA API query
+    faa_result = {
+        "data": {
+            "items": [
+                {
+                    "makeName": "ExampleMake",
+                    "modelName": "ModelX",
+                    "series": "A1",
+                    "trackingNumber": "123456",
+                    "complianceCategories": "Standard",
+                    "updatedAt": datetime.now().isoformat()
+                }
+            ]
+        }
+    }
+    # Save to cache and tracked_pairs
+    FAA_CACHE[(mac, remote_id)] = faa_result
+    TRACKED_PAIRS[mac] = {"basic_id": remote_id, "faa_data": faa_result}
+    # Log to CSV
+    if FAA_LOG_FILENAME:
+        try:
+            file_exists = os.path.isfile(FAA_LOG_FILENAME)
+            with open(FAA_LOG_FILENAME, "a", newline='') as csvfile:
+                fieldnames = ["timestamp", "mac", "remote_id", "faa_response"]
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                if not file_exists:
+                    writer.writeheader()
+                writer.writerow({
+                    "timestamp": datetime.now().isoformat(),
+                    "mac": mac,
+                    "remote_id": remote_id,
+                    "faa_response": json.dumps(faa_result)
+                })
+        except Exception as e:
+            print("Error writing to FAA log CSV:", e)
+    return jsonify({"status": "ok", "faa_data": faa_result})
+
+# --- FAA Data GET API Endpoint (by MAC or basic_id) ---
+@app.route('/api/faa/<identifier>', methods=['GET'])
+def api_get_faa(identifier):
+    """
+    Retrieve cached FAA data by MAC address or by basic_id (remote ID).
+    """
+    # Lookup by MAC in tracked_pairs
+    if identifier in TRACKED_PAIRS and 'faa_data' in TRACKED_PAIRS[identifier]:
+        return jsonify({'status': 'ok', 'faa_data': TRACKED_PAIRS[identifier]['faa_data']})
+    # Lookup by basic_id in tracked_pairs
+    for mac, det in TRACKED_PAIRS.items():
+        if det.get('basic_id') == identifier and 'faa_data' in det:
+            return jsonify({'status': 'ok', 'faa_data': det['faa_data']})
+    # FAA_CACHE search by remote_id then by MAC
+    for (c_mac, c_rid), faa_data in FAA_CACHE.items():
+        if c_rid == identifier:
+            return jsonify({'status': 'ok', 'faa_data': faa_data})
+    for (c_mac, c_rid), faa_data in FAA_CACHE.items():
+        if c_mac == identifier:
+            return jsonify({'status': 'ok', 'faa_data': faa_data})
+    return jsonify({'status': 'error', 'message': 'No FAA data found for this identifier'}), 404
