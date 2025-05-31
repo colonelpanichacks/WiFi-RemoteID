@@ -66,19 +66,18 @@ last_kml_generation = 0
 last_cumulative_kml_generation = 0
 
 def cleanup_old_detections():
-    """Remove stale detections from tracked_pairs to prevent memory leak"""
+    """Mark stale detections as inactive instead of removing them to preserve session persistence"""
     current_time = time.time()
-    stale_keys = []
     
     for mac, detection in tracked_pairs.items():
         last_update = detection.get('last_update', 0)
-        if current_time - last_update > staleThreshold * 5:  # 5x stale threshold
-            stale_keys.append(mac)
+        # Instead of deleting, mark as inactive for very old detections (30+ minutes)
+        if current_time - last_update > staleThreshold * 30:  # 30x stale threshold (30 minutes)
+            detection['status'] = 'inactive_old'  # Mark as very old but keep in session
+        elif current_time - last_update > staleThreshold * 3:  # 3x stale threshold (3 minutes)
+            detection['status'] = 'inactive'  # Mark as inactive but keep in session
     
-    for key in stale_keys:
-        del tracked_pairs[key]
-    
-    # Limit FAA cache size
+    # Only clean up FAA cache, but keep drone detections for session persistence
     if len(FAA_CACHE) > MAX_FAA_CACHE_SIZE:
         keys_to_remove = list(FAA_CACHE.keys())[:100]
         for key in keys_to_remove:
@@ -799,6 +798,8 @@ def update_detection(detection):
         print(f"No-GPS detection for {mac}; forwarding for processing.")
         # Set last_update for no-GPS detections so they can be tracked for timeout
         detection["last_update"] = time.time()
+        # Mark as active since this is a fresh detection
+        detection["status"] = "active"
         
         # Preserve previous basic_id if new detection lacks one (same logic as GPS section)
         if not detection.get("basic_id") and mac in tracked_pairs and tracked_pairs[mac].get("basic_id"):
@@ -895,6 +896,8 @@ def update_detection(detection):
     detection["pilot_lat"] = detection.get("pilot_lat", 0)
     detection["pilot_long"] = detection.get("pilot_long", 0)
     detection["last_update"] = time.time()
+    # Mark as active since this is a fresh detection
+    detection["status"] = "active"
 
     # Preserve previous basic_id if new detection lacks one
     if not detection.get("basic_id") and mac in tracked_pairs and tracked_pairs[mac].get("basic_id"):
@@ -3913,6 +3916,7 @@ def api_detections_history():
 def reactivate(mac):
     if mac in tracked_pairs:
         tracked_pairs[mac]['last_update'] = time.time()
+        tracked_pairs[mac]['status'] = 'active'  # Mark as active when manually reactivated
         print(f"Reactivated {mac}")
         return jsonify({"status": "reactivated", "mac": mac})
     else:
