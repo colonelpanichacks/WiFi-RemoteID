@@ -18,6 +18,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from flask import Flask, request, jsonify, redirect, url_for, render_template, render_template_string, send_file
 from flask_socketio import SocketIO, emit
+from collections import deque
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ----------------------
@@ -54,6 +55,45 @@ HEADLESS_MODE = False
 AUTO_START_ENABLED = True
 PORT_MONITOR_INTERVAL = 10  # seconds
 SHUTDOWN_EVENT = threading.Event()
+
+# ----------------------
+# Performance Optimizations
+# ----------------------
+MAX_DETECTION_HISTORY = 1000  # Limit detection history size
+MAX_FAA_CACHE_SIZE = 500      # Limit FAA cache size
+KML_GENERATION_INTERVAL = 30  # Only regenerate KML every 30 seconds
+last_kml_generation = 0
+last_cumulative_kml_generation = 0
+
+def cleanup_old_detections():
+    """Remove stale detections from tracked_pairs to prevent memory leak"""
+    current_time = time.time()
+    stale_keys = []
+    
+    for mac, detection in tracked_pairs.items():
+        last_update = detection.get('last_update', 0)
+        if current_time - last_update > staleThreshold * 5:  # 5x stale threshold
+            stale_keys.append(mac)
+    
+    for key in stale_keys:
+        del tracked_pairs[key]
+    
+    # Limit FAA cache size
+    if len(FAA_CACHE) > MAX_FAA_CACHE_SIZE:
+        keys_to_remove = list(FAA_CACHE.keys())[:100]
+        for key in keys_to_remove:
+            del FAA_CACHE[key]
+
+def start_cleanup_timer():
+    """Start periodic cleanup every 5 minutes"""
+    def cleanup_timer():
+        while not SHUTDOWN_EVENT.is_set():
+            cleanup_old_detections()
+            time.sleep(300)  # 5 minutes
+    
+    cleanup_thread = threading.Thread(target=cleanup_timer, daemon=True)
+    cleanup_thread.start()
+    logger.info("Cleanup timer started")
 
 # ----------------------
 # Signal Handlers for Graceful Shutdown
@@ -195,7 +235,7 @@ def load_webhook_url():
 # Global Variables & Files
 # ----------------------
 tracked_pairs = {}
-detection_history = []  # For CSV logging and KML generation
+detection_history = deque(maxlen=MAX_DETECTION_HISTORY)  # Limit size to prevent memory growth
 
 # Changed: Instead of one selected port, we allow up to three.
 SELECTED_PORTS = {}  # key will be 'port1', 'port2', 'port3'
@@ -427,26 +467,34 @@ def start_status_logging():
         logger.info("Status logging thread started")
 
 def start_websocket_broadcaster():
-    """Start background task to broadcast WebSocket updates every 2 seconds"""
+    """Start background task to broadcast WebSocket updates every 5 seconds (optimized)"""
     def broadcaster():
         while not SHUTDOWN_EVENT.is_set():
             try:
-                # Emit all data types every 2 seconds
-                emit_detections()
-                emit_serial_status()
-                emit_paths()
-                emit_aliases()
-                emit_cumulative_log()
-                emit_faa_cache()
+                # Only emit if there are connected clients to reduce CPU usage
+                if hasattr(socketio, 'server') and hasattr(socketio.server, 'manager'):
+                    # Emit critical data more frequently
+                    emit_detections()
+                    emit_serial_status()
+                    
+                    # Emit less critical data less frequently
+                    if int(time.time()) % 10 == 0:  # Every 10 seconds
+                        emit_paths()
+                        emit_aliases()
+                    
+                    if int(time.time()) % 30 == 0:  # Every 30 seconds
+                        emit_cumulative_log()
+                        emit_faa_cache()
             except Exception as e:
                 # Ignore errors if no clients connected
                 pass
             
-            # Wait 2 seconds before next broadcast
-            for _ in range(20):  # 20 * 0.1 = 2 seconds, but check shutdown every 0.1s
+            # Wait 5 seconds instead of 2 to reduce CPU usage
+            for _ in range(50):  # 50 * 0.1 = 5 seconds, but check shutdown every 0.1s
                 if SHUTDOWN_EVENT.is_set():
                     break
                 time.sleep(0.1)
+    
     
     broadcaster_thread = threading.Thread(target=broadcaster, daemon=True)
     broadcaster_thread.start()
@@ -584,6 +632,23 @@ def generate_kml():
         f.write("\n".join(kml_lines))
     print("Updated session KML:", KML_FILENAME)
 
+def generate_kml_throttled():
+    """Only regenerate KML if enough time has passed"""
+    global last_kml_generation
+    current_time = time.time()
+    
+    if current_time - last_kml_generation > KML_GENERATION_INTERVAL:
+        generate_kml()
+        last_kml_generation = current_time
+
+def generate_cumulative_kml_throttled():
+    """Only regenerate cumulative KML if enough time has passed"""
+    global last_cumulative_kml_generation
+    current_time = time.time()
+    
+    if current_time - last_cumulative_kml_generation > KML_GENERATION_INTERVAL:
+        generate_cumulative_kml()
+        last_cumulative_kml_generation = current_time
 
 # New generate_cumulative_kml function
 def generate_cumulative_kml():
@@ -809,12 +874,18 @@ def update_detection(detection):
                 'faa_data': json.dumps(detection.get('faa_data', {}))
             })
         # Regenerate full cumulative KML
-        generate_cumulative_kml()
-
+        generate_cumulative_kml_throttled()
+        generate_kml_throttled()
+        
+        # Reduce WebSocket emissions - only emit detection, not all data types
+        try:
+            socketio.emit('detection', detection, )
+        except Exception:
+            pass
+        
         # Cache FAA data even for no-GPS
         if detection.get('basic_id'):
             write_to_faa_cache(mac, detection['basic_id'], detection.get('faa_data', {}))
-        generate_kml()
         return
 
     # Otherwise, use the provided non-zero coordinates.
@@ -901,8 +972,8 @@ def update_detection(detection):
             'faa_data': json.dumps(detection.get('faa_data', {}))
         })
     # Regenerate full cumulative KML
-    generate_cumulative_kml()
-    generate_kml()
+    generate_cumulative_kml_throttled()
+    generate_kml_throttled()
     
     # Emit real-time updates via WebSocket (if available in this context)
     try:
@@ -4245,6 +4316,9 @@ def main():
     
     # Perform startup auto-connection
     startup_auto_connect()
+    
+    # Start cleanup timer to prevent memory leaks
+    start_cleanup_timer()
     
     if HEADLESS_MODE:
         logger.info("Running in headless mode - press Ctrl+C to stop")
