@@ -2225,6 +2225,10 @@ HTML_PAGE = '''
         <button id="downloadCumulativeCsv">Cumulative CSV</button>
         <button id="downloadCumulativeKml">Cumulative KML</button>
       </div>
+      <div id="uploadAliasesSection" style="display:flex; gap:4px; justify-content:center; margin-top:4px;">
+        <input type="file" id="aliasFileInput" accept=".json" style="display:none;">
+        <button id="uploadAliasesBtn">Upload Aliases</button>
+      </div>
     </div>
     <!-- Basemap Section -->
     <div style="margin-top:4px;">
@@ -3695,46 +3699,77 @@ function updateColor(mac, hue) {
       .catch(err => console.error('Service Worker registration failed', err));
   }
 </script>
+<script>
+  // Upload Aliases functionality
+  document.getElementById('uploadAliasesBtn').addEventListener('click', function() {
+    document.getElementById('aliasFileInput').click();
+  });
+  
+  document.getElementById('aliasFileInput').addEventListener('change', function(event) {
+    const file = event.target.files[0];
+    if (file) {
+      const formData = new FormData();
+      formData.append('aliases_file', file);
+      
+      // Show upload feedback
+      const uploadBtn = document.getElementById('uploadAliasesBtn');
+      const originalText = uploadBtn.textContent;
+      uploadBtn.textContent = 'Uploading...';
+      uploadBtn.style.backgroundColor = 'orange';
+      uploadBtn.disabled = true;
+      
+      fetch('/upload/aliases', {
+        method: 'POST',
+        body: formData
+      })
+      .then(response => response.json())
+      .then(data => {
+        if (data.success) {
+          uploadBtn.textContent = 'Upload Success!';
+          uploadBtn.style.backgroundColor = 'green';
+          // Update aliases display if successful
+          if (data.aliases) {
+            aliases = data.aliases;
+            updateComboList(window.tracked_pairs);
+          }
+        } else {
+          uploadBtn.textContent = 'Upload Failed';
+          uploadBtn.style.backgroundColor = 'red';
+          console.error('Upload error:', data.error);
+        }
+        
+        // Reset button after 2 seconds
+        setTimeout(() => {
+          uploadBtn.textContent = originalText;
+          uploadBtn.style.backgroundColor = '#333';
+          uploadBtn.disabled = false;
+        }, 2000);
+      })
+      .catch(error => {
+        console.error('Upload error:', error);
+        uploadBtn.textContent = 'Upload Failed';
+        uploadBtn.style.backgroundColor = 'red';
+        
+        // Reset button after 2 seconds
+        setTimeout(() => {
+          uploadBtn.textContent = originalText;
+          uploadBtn.style.backgroundColor = '#333';
+          uploadBtn.disabled = false;
+        }, 2000);
+      });
+      
+      // Clear the file input
+      event.target.value = '';
+    }
+  });
+</script>
 </body>
 </html>
-<script>
-  if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('/sw.js')
-      .then(reg => console.log('Service Worker registered', reg))
-      .catch(err => console.error('Service Worker registration failed', err));
-  }
-</script>
 '''
-# ----------------------
-# New route: USB port selection for multiple ports.
-# ----------------------
+
 @app.route('/sw.js')
 def service_worker():
-    sw_code = '''
-self.addEventListener('install', function(event) {
-  event.waitUntil(
-    caches.open('tile-cache').then(function(cache) {
-      return cache.addAll([]);
-    })
-  );
-});
-self.addEventListener('fetch', function(event) {
-  var url = event.request.url;
-  // Only cache tile requests
-  if (url.includes('tile.openstreetmap.org') || url.includes('basemaps.cartocdn.com') || url.includes('server.arcgisonline.com') || url.includes('tile.opentopomap.org')) {
-    event.respondWith(
-      caches.open('tile-cache').then(function(cache) {
-        return cache.match(event.request).then(function(response) {
-          return response || fetch(event.request).then(function(networkResponse) {
-            cache.put(event.request, networkResponse.clone());
-            return networkResponse;
-          });
-        });
-      })
-    );
-  }
-});
-'''
+    sw_code = 'console.log("Service worker");'
     response = app.make_response(sw_code)
     response.headers['Content-Type'] = 'application/javascript'
     return response
@@ -3849,7 +3884,7 @@ LOGO_ASCII = r"""
         _____                .__      ________          __                 __       
        /     \   ____   _____|  |__   \______ \   _____/  |_  ____   _____/  |_     
       /  \ /  \_/ __ \ /  ___/  |  \   |    |  \_/ __ \   __\/ __ \_/ ___\   __\    
-     /    Y    \  ___/ \___ \|   Y  \  |    `   \  ___/|  | \  ___/\  \___|  |      
+     /    Y    \  ___/ \___ \|   Y  \  |    `   \/ __ \   __\/ __ \_/ ___\   __\    
      \____|__  /\___  >____  >___|  / /_______  /\___  >__|  \___  >\___  >__|      
              \/     \/     \/     \/          \/     \/     \/          \/     \/          
 ________                                  _____                                     
@@ -4189,12 +4224,60 @@ def download_cumulative_csv():
 def download_cumulative_kml():
     # regenerate cumulative KML to include latest detections
     generate_cumulative_kml()
+    
     return send_file(
-        CUMULATIVE_KML_FILENAME,
-        mimetype='application/vnd.google-earth.kml+xml',
+        'cumulative.kml',
         as_attachment=True,
         download_name='cumulative.kml'
     )
+
+@app.route('/upload/aliases', methods=['POST'])
+def upload_aliases():
+    """Handle aliases file upload"""
+    global ALIASES
+    
+    try:
+        if 'aliases_file' not in request.files:
+            return jsonify({'success': False, 'error': 'No file provided'})
+        
+        file = request.files['aliases_file']
+        if file.filename == '':
+            return jsonify({'success': False, 'error': 'No file selected'})
+        
+        # Read and parse the JSON file
+        try:
+            content = file.read().decode('utf-8')
+            uploaded_aliases = json.loads(content)
+            
+            # Validate that it's a dictionary
+            if not isinstance(uploaded_aliases, dict):
+                return jsonify({'success': False, 'error': 'Invalid aliases format - must be a JSON object'})
+            
+            # Update the global ALIASES dictionary
+            ALIASES.update(uploaded_aliases)
+            
+            # Save the updated aliases to disk
+            save_aliases()
+            
+            # Emit updated aliases to all connected clients
+            emit_aliases()
+            
+            logger.info(f"Successfully uploaded {len(uploaded_aliases)} alias(es)")
+            
+            return jsonify({
+                'success': True, 
+                'message': f'Successfully uploaded {len(uploaded_aliases)} alias(es)',
+                'aliases': ALIASES
+            })
+            
+        except json.JSONDecodeError as e:
+            return jsonify({'success': False, 'error': f'Invalid JSON format: {str(e)}'})
+        except UnicodeDecodeError as e:
+            return jsonify({'success': False, 'error': f'File encoding error: {str(e)}'})
+            
+    except Exception as e:
+        logger.error(f"Error uploading aliases: {e}")
+        return jsonify({'success': False, 'error': f'Upload failed: {str(e)}'})
 
 # ----------------------
 # Startup Auto-Connection
